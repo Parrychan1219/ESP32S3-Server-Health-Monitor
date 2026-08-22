@@ -39,16 +39,12 @@
 // >>> YOUR SITES GO HERE <<<
 // ---------------------------------------------------------------------------
 
-SITE("dllmch.org", "https://dllmch.org/")
-SITE("www.dllmch.org", "https://www.dllmch.org/")
+SITE("dllmch.org", "https://dllmch.org/") // same as www.dllmch.org
 SITE("cdn.dllmch.org", "https://cdn.dllmch.org/") // This is the obfuscation subdomain for VPN
 SITE("cloud.dllmch.org", "https://cloud.dllmch.org/")
 SITE("crossplay.mc.dllmch.org", "https://crossplay.mc.dllmch.org/")
 SITE("share.dllmch.org", "https://share.dllmch.org/")
-SITE("media.dllmch.org", "https://media.dllmch.org/")
 
-SITE("sy19.org",   "https://sy19.org/")
-SITE("www.sy19.org",   "https://www.sy19.org/")
 SITE("moodle.sy19.org",   "https://moodle.sy19.org/")
 
 // ---------------------------------------------------------------------------
