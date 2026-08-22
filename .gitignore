@@ -1,3 +1,26 @@
-# .gitignore
-*.DS_Store
+# ---- secrets: never commit these ----
 secrets.h
+
+# ---- build output ----
+build/
+build-ota/
+*.bin
+*.elf
+*.map
+*.hex
+*.d
+
+# ---- editor / tooling ----
+.vscode/
+.idea/
+*.swp
+*~
+*.bak
+*.orig
+
+# ---- macOS ----
+.DS_Store
+*.DS_Store
+._*
+.Spotlight-V100
+.Trashes
