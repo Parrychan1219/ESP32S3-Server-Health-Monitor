@@ -164,10 +164,17 @@ binaries that are in fact blocked, so do not trust it as a check.
 | Command | Does |
 |---|---|
 | `/status` | Uptime, boot count, outage totals, per-site availability, RSSI, free heap |
-| `/check` | Runs a check cycle immediately |
+| `/check` | Runs a check cycle immediately instead of waiting for the next one |
 | `/reboot` | Restarts the board |
+| `/help` | Lists the commands and what they do |
 
-Only messages from the configured chat ID are obeyed.
+Anything else — a typo, an unknown slash command, plain text, or a message with
+no text at all such as a sticker — gets a short "not a command" reply pointing
+at `/help`. `/start`, which Telegram sends when the chat is first opened, shows
+the help.
+
+Only messages from the configured chat ID are obeyed. Commands are picked up
+every `TG_POLL_MS` (5s), so a reply can lag by that much.
 
 ## How the trickier parts work
 
@@ -205,6 +212,7 @@ Tunables live near the top of `src/main.cpp`:
 | `REBOOT_AFTER_MS` | 15 min | Self-reboot if WiFi never returns |
 | `TZ_INFO` | `HKT-8` | POSIX timezone string |
 | `DIGEST_HOUR` | 9 | Hour for the daily report |
+| `TG_POLL_MS` | 5 s | How often Telegram is polled for commands |
 
 Keep the site list under about six entries, or a cycle full of timeouts will
 run past the next cycle.

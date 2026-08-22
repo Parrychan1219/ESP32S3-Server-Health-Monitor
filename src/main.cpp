@@ -71,7 +71,7 @@ const uint8_t   SERVER_FAIL_STRIKES = 3;      // unchanged from before
 const unsigned long HEARTBEAT_MS    = 60000;  // NVS "still alive" write interval
 const unsigned long WIFI_RETRY_MS   = 15000;  // reconnect attempt spacing
 const unsigned long REBOOT_AFTER_MS = 900000; // reboot if WiFi dead 15 min
-const unsigned long TG_POLL_MS      = 15000;  // Telegram command poll interval
+const unsigned long TG_POLL_MS      = 5000;   // Telegram command poll interval
 
 #define TZ_INFO       "HKT-8"                 // POSIX TZ: Hong Kong, UTC+8, no DST
 #define DIGEST_HOUR   9                       // daily report at 09:00 local
@@ -456,6 +456,28 @@ void sendBootReport() {
 #if ENABLE_TG_COMMANDS
 long tgOffset = 0;
 
+String helpText() {
+  return
+    "Server Pinger - available commands\n"
+    "\n"
+    "/status\n"
+    "    Current state: uptime, boot count, outage totals, per-site\n"
+    "    availability, WiFi signal and free heap.\n"
+    "\n"
+    "/check\n"
+    "    Run a check cycle immediately instead of waiting for the\n"
+    "    next one, which can be up to a minute away.\n"
+    "\n"
+    "/reboot\n"
+    "    Restart the board. It reports back once it is up again.\n"
+    "\n"
+    "/help\n"
+    "    This message.\n"
+    "\n"
+    "Alerts are sent on their own when a site or the server goes down\n"
+    "or recovers, when the internet drops, and after a power cut.";
+}
+
 void handleCommand(const String &cmd) {
   Serial.println("[*] Command: " + cmd);
 
@@ -468,8 +490,14 @@ void handleCommand(const String &cmd) {
     notify("Rebooting on request.");
     delay(500);
     ESP.restart();
-  } else if (cmd.startsWith("/")) {
-    notify("Commands: /status  /check  /reboot");
+  } else if (cmd.startsWith("/help") || cmd.startsWith("/start")) {
+    // /start is what Telegram sends when the chat is first opened.
+    notify(helpText());
+  } else {
+    // Anything else, slash-prefixed or not, is not something we know.
+    String shown = cmd;
+    if (shown.length() > 40) shown = shown.substring(0, 40) + "...";
+    notify("Not a command: \"" + shown + "\"\n\nSend /help to see what I understand.");
   }
 }
 
@@ -499,6 +527,11 @@ void handleTelegramUpdates(const String &body) {
           txt.toLowerCase();
           handleCommand(txt);
         }
+      } else {
+        // A sticker, photo or voice note. allowed_updates keeps this to
+        // real messages, so there is nothing else this could be.
+        Serial.println("[*] Non-text message from owner");
+        notify("Not a command: that message has no text.\n\nSend /help to see what I understand.");
       }
     }
 
@@ -518,7 +551,8 @@ void pollTelegram() {
   http.setTimeout(8000);
 
   String url = "https://api.telegram.org/bot" + tg_token +
-               "/getUpdates?timeout=0&limit=5";
+               "/getUpdates?timeout=0&limit=5"
+               "&allowed_updates=%5B%22message%22%5D";
   if (tgOffset) url += "&offset=" + String(tgOffset);
 
   if (!http.begin(client, url)) return;
