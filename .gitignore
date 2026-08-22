@@ -1,14 +1,10 @@
-# ---- secrets: never commit these ----
-secrets.h
+# ---- secrets: never commit ----
+src/secrets.h
 
-# ---- build output ----
-build/
-build-ota/
-*.bin
-*.elf
-*.map
-*.hex
-*.d
+# ---- PlatformIO ----
+.pio/
+.pioenvs/
+.piolibdeps/
 
 # ---- editor / tooling ----
 .vscode/
@@ -20,7 +16,6 @@ build-ota/
 
 # ---- macOS ----
 .DS_Store
-*.DS_Store
 ._*
 .Spotlight-V100
 .Trashes

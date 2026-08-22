@@ -1,3 +1,4 @@
+#include <Arduino.h>
 /*
  * ESP32-S3 Server Pinger
  * ----------------------
