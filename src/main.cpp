@@ -456,6 +456,31 @@ void sendBootReport() {
 #if ENABLE_TG_COMMANDS
 long tgOffset = 0;
 
+// Telegram keeps handing back an update until getUpdates is called with an
+// offset past it; an unconfirmed one sits in the queue for ~24h. That makes a
+// reboot command self-repeating: reboot, poll, get the same /reboot, reboot.
+// The offset therefore has to survive the restart (NVS) *and* be confirmed
+// with Telegram before the board goes down (tgConfirmOffset).
+void saveTgOffset() {
+  prefs.putULong("tgOffset", (uint32_t)tgOffset);
+}
+
+void tgConfirmOffset() {
+  if (!tgOffset || WiFi.status() != WL_CONNECTED) return;
+
+  WiFiClientSecure client;
+  client.setInsecure();
+  HTTPClient http;
+  http.setConnectTimeout(6000);
+  http.setTimeout(8000);
+
+  String url = "https://api.telegram.org/bot" + tg_token +
+               "/getUpdates?timeout=0&limit=1&offset=" + String(tgOffset);
+  if (!http.begin(client, url)) return;
+  http.GET();
+  http.end();
+}
+
 String helpText() {
   return
     "Server Pinger - available commands\n"
@@ -488,6 +513,7 @@ void handleCommand(const String &cmd) {
     lastPingTime = millis() - PING_INTERVAL; // force the next loop() to run one
   } else if (cmd.startsWith("/reboot")) {
     notify("Rebooting on request.");
+    tgConfirmOffset();   // or Telegram replays this command into the next boot
     delay(500);
     ESP.restart();
   } else if (cmd.startsWith("/help") || cmd.startsWith("/start")) {
@@ -510,7 +536,7 @@ void handleTelegramUpdates(const String &body) {
     int numEnd = body.indexOf(',', u + 12);
     if (numEnd < 0) break;
     long id = body.substring(u + 12, numEnd).toInt();
-    if (id >= tgOffset) tgOffset = id + 1;
+    if (id >= tgOffset) { tgOffset = id + 1; saveTgOffset(); }
 
     int next  = body.indexOf("\"update_id\":", u + 12);
     int limit = (next < 0) ? body.length() : next;
@@ -836,6 +862,9 @@ void setup() {
   lastSeenAtBoot = (time_t)prefs.getULong("lastSeen", 0);
   pendingOutage  = (time_t)prefs.getULong("outSince", 0);
   prefs.putUInt("boots", bootCount);
+#if ENABLE_TG_COMMANDS
+  tgOffset = (long)prefs.getULong("tgOffset", 0);
+#endif
 
   Serial.printf("\n[*] Boot #%lu, reason: %s\n",
                 (unsigned long)bootCount, resetReasonStr(bootReason));
