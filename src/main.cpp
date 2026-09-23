@@ -108,7 +108,8 @@ enum DeviceState {
   WIFI_CONNECTED_IDLE,
   OTA_ACTIVE
 };
-DeviceState currentState = WIFI_DOWN;
+// Written by loop() and the OTA callback, read by the LED task on the other core.
+volatile DeviceState currentState = WIFI_DOWN;
 
 struct SiteState {
   bool     up;
@@ -127,8 +128,6 @@ unsigned long lastPingTime      = 0;
 unsigned long lastHeartbeatMs   = 0;
 unsigned long lastWifiTry       = 0;
 unsigned long lastTgPoll        = 0;
-unsigned long flashTimer        = 0;
-bool          flashState        = false;
 bool          firstCycleDone    = false;
 
 // failover reports: written by the web task, acted on by loop()
@@ -165,6 +164,9 @@ volatile bool otaInProgress   = false;
 #define RGB_BUILTIN 48
 #endif
 uint32_t lastRGBWritten = 0xFFFFFFFF;
+uint32_t lastRGBWriteMs = 0;
+#define LED_TICK_MS     10     // LED task period
+#define LED_REFRESH_MS  1000   // re-send the colour even if unchanged
 
 // ================================================================ helpers
 
@@ -227,15 +229,22 @@ const char* resetReasonStr(esp_reset_reason_t r) {
 }
 
 // ================================================================ LEDs
+// The LED is driven by its own task on core 0 (see ledTask), never by loop().
+// loop() runs on core 1 and can sit in a ping or HTTPS timeout for tens of
+// seconds; when it drove the LED, a flash froze in whichever half it was in --
+// out of rhythm, or dark for the whole stall if that half was "off".
 
 void writeRGB(uint8_t r, uint8_t g, uint8_t b) {
   uint32_t v = ((uint32_t)r << 16) | ((uint32_t)g << 8) | b;
-  if (v == lastRGBWritten) return;
+  // Unchanged colours are still re-sent every LED_REFRESH_MS, so a write the
+  // LED missed cannot leave it dark or wrong until the next state change.
+  if (v == lastRGBWritten && millis() - lastRGBWriteMs < LED_REFRESH_MS) return;
   lastRGBWritten = v;
+  lastRGBWriteMs = millis();
   neopixelWrite(RGB_BUILTIN, r, g, b);
 }
 
-void setLED(uint8_t r, uint8_t g, uint8_t b) {
+void setLED(DeviceState state, uint8_t r, uint8_t g, uint8_t b) {
   // Scale down heavily to absolute single digits because the hardware curve is clapped
   uint8_t dim_r = r > 0 ? 8 : 0;
   uint8_t dim_g = g > 0 ? 8 : 0;
@@ -244,33 +253,46 @@ void setLED(uint8_t r, uint8_t g, uint8_t b) {
   if (r == 128 && b == 128) { dim_r = 4; dim_b = 4; }   // purple
   if (r == 255 && g == 255) { dim_r = 4; dim_g = 4; }   // yellow
 
-  if (currentState == SERVER_DEAD_INTERNET_UP) {
+  if (state == SERVER_DEAD_INTERNET_UP) {
     writeRGB(r, g, b);          // full brightness, this one matters
   } else {
     writeRGB(dim_r, dim_g, dim_b);
   }
 }
 
-void flash(uint8_t r, uint8_t g, uint8_t b, uint16_t period) {
-  if (millis() - flashTimer > period) {
-    flashTimer = millis();
-    flashState = !flashState;
-  }
-  if (flashState) setLED(r, g, b);
-  else            setLED(0, 0, 0);
+// The on/off phase comes from the clock, not from a toggle, so the rhythm is
+// exact and cannot drift however late a tick runs.
+void flash(DeviceState state, uint8_t r, uint8_t g, uint8_t b, uint16_t period) {
+  if ((millis() / period) % 2 == 0) setLED(state, r, g, b);
+  else                              setLED(state, 0, 0, 0);
 }
 
-void handleLEDs() {
-  switch (currentState) {
-    case WIFI_DOWN:               setLED(255, 0, 0);          break; // red
-    case WIFI_CONNECTED_IDLE:     setLED(128, 0, 128);        break; // purple
-    case NO_INTERNET_WIFI_OK:     flash(128, 0, 128, 500);    break; // purple flash
-    case SERVER_UP:               setLED(0, 255, 0);          break; // green
-    case SERVER_MISSED_LATEST:    setLED(255, 255, 0);        break; // yellow
-    case SERVER_DEAD_INTERNET_UP: flash(255, 0, 0, 500);      break; // red flash
-    case SITE_DOWN_SERVER_UP:     flash(0, 0, 255, 800);      break; // blue flash
-    case OTA_ACTIVE:              flash(0, 0, 255, 120);      break; // fast blue = flashing
+void showState(DeviceState state) {
+  switch (state) {
+    case WIFI_DOWN:               setLED(state, 255, 0, 0);          break; // red
+    case WIFI_CONNECTED_IDLE:     setLED(state, 128, 0, 128);        break; // purple
+    case NO_INTERNET_WIFI_OK:     flash(state, 128, 0, 128, 500);    break; // purple flash
+    case SERVER_UP:               setLED(state, 0, 255, 0);          break; // green
+    case SERVER_MISSED_LATEST:    setLED(state, 255, 255, 0);        break; // yellow
+    case SERVER_DEAD_INTERNET_UP: flash(state, 255, 0, 0, 500);      break; // red flash
+    case SITE_DOWN_SERVER_UP:     flash(state, 0, 0, 255, 800);      break; // blue flash
+    case OTA_ACTIVE:              flash(state, 0, 0, 255, 120);      break; // fast blue = flashing
   }
+}
+
+// Sole owner of the LED. Priority 2 keeps it ahead of the OTA and web tasks
+// (priority 1) on core 0; it sleeps between ticks, so it costs next to nothing.
+void ledTask(void* param) {
+  for (;;) {
+    // OTA wins even if a check cycle that was already running overwrites
+    // currentState after the upload started.
+    showState(otaInProgress ? OTA_ACTIVE : currentState);
+    vTaskDelay(pdMS_TO_TICKS(LED_TICK_MS));
+  }
+}
+
+void startLEDs() {
+  xTaskCreatePinnedToCore(ledTask, "ledTask", 3072, nullptr, 2, nullptr, 0);
 }
 
 // ================================================================ Telegram
@@ -790,7 +812,9 @@ void runCheckCycle() {
     }
     failedServerPings = 0;
     serverUp = true;
-    currentState = SERVER_UP;
+    // Stay blue while the sites are rechecked below, rather than showing green
+    // for the tens of seconds that takes; the end of the cycle settles it.
+    if (currentState != SITE_DOWN_SERVER_UP) currentState = SERVER_UP;
     Serial.println("[+] Server is alive.");
   } else {
     failedServerPings++;
@@ -822,7 +846,8 @@ void runCheckCycle() {
   }
 
   // site trouble only colours the LED when the LAN server itself looks fine
-  if (anySiteDown && currentState == SERVER_UP) currentState = SITE_DOWN_SERVER_UP;
+  if (serverUp && failedServerPings == 0)
+    currentState = anySiteDown ? SITE_DOWN_SERVER_UP : SERVER_UP;
 
   firstCycleDone = true;
   Serial.println("[*] ===== cycle done =====\n");
@@ -1003,7 +1028,7 @@ void setup() {
   }
 
   currentState = WIFI_DOWN;
-  handleLEDs();
+  startLEDs();
 
   if (!WiFi.config(local_IP, gateway, subnet, primaryDNS, secondaryDNS)) {
     Serial.println("STA Failed to configure");
@@ -1019,7 +1044,6 @@ void setup() {
   // Don't block forever - loop() has proper reconnect handling.
   uint32_t t0 = millis();
   while (WiFi.status() != WL_CONNECTED && millis() - t0 < 30000) {
-    handleLEDs();
     Serial.print(".");
     delay(500);
   }
@@ -1038,14 +1062,12 @@ void setup() {
     Serial.println("\n[-] Could not join WiFi in 30s, continuing in retry mode.");
   }
 
-  handleLEDs();
   lastHeartbeatMs = millis();
 }
 
 void loop() {
   // While an image is streaming in, keep off the network and out of the heap.
   if (otaInProgress) {
-    handleLEDs();
     delay(20);
     return;
   }
@@ -1074,6 +1096,5 @@ void loop() {
   }
 
   heartbeat();
-  handleLEDs();
   delay(20);
 }

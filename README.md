@@ -161,6 +161,13 @@ binaries that are in fact blocked, so do not trust it as a check.
 | 🔵 Blue (slow) | One or more sites are down, internet up |
 | 🔵 Blue (fast) | OTA update in progress |
 
+The LED is driven by its own FreeRTOS task on core 0, not by the main loop, so
+it keeps its rhythm while a check cycle is stuck in a timeout. The blink phase
+is taken from the clock rather than toggled, and the current colour is re-sent
+every second even when it has not changed, so a missed write cannot leave the
+LED dark. (Before 2026-09-24 the loop drove it, and a flash froze -- sometimes
+in its "off" half -- for as long as a check blocked.)
+
 ## Telegram commands
 
 | Command | Does |
