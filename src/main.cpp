@@ -7,13 +7,16 @@
  *  - Timestamps + durations for WiFi/internet outages
  *  - Detects power outages across reboots via an NVS heartbeat
  *  - Telegram alerts (queued while offline, flushed on recovery)
- *  - Telegram commands: /status /check /reboot
+ *  - Telegram commands: /status /server /check /reboot
+ *  - /server relays a status text the LAN server regenerates every minute
+ *  - Relays iMac failover on/off reports (POST /failover, LAN) to Telegram
  *  - Daily digest, OTA updates
  */
 
 #include <WiFi.h>
 #include <ESP32Ping.h>
 #include <HTTPClient.h>
+#include <WebServer.h>
 #include <WiFiClientSecure.h>
 #include <Preferences.h>
 #include <esp_system.h>
@@ -24,6 +27,7 @@
 #define ENABLE_OTA          1   // flash over WiFi instead of unplugging the board
 #define ENABLE_TG_COMMANDS  1   // reply to /status /check /reboot in Telegram
 #define ENABLE_DAILY_DIGEST 1
+#define ENABLE_FAILOVER_API 1   // accept failover on/off reports from the iMac
 
 #if ENABLE_OTA
   #include <ArduinoOTA.h>
@@ -44,6 +48,20 @@ IPAddress primaryDNS(8, 8, 8, 8);
 IPAddress secondaryDNS(1, 1, 1, 1);
 
 IPAddress server_IP(192, 168, 1, 200);
+
+// Server details for /server. Plain HTTP on the LAN, by IP: this board resolves
+// through public DNS on purpose (so the server being down cannot blind it), and
+// the server's names only resolve to its LAN address through the server's own
+// resolver. nginx answers this one path for LAN clients only.
+const char*    SERVER_STATUS_URL        = "http://192.168.1.200/pinger/status.txt";
+const uint16_t SERVER_STATUS_TIMEOUT_MS = 5000;
+const uint16_t SERVER_STATUS_MAX_CHARS  = 1500;   // Telegram GET URL stays sane
+// The iMac that stands in for the server on 443 (mhs-failover). It reports each
+// takeover and hand-back with POST /failover?state=on|off; only it may.
+// .254 is the shared 443 address, which it holds while failed over.
+IPAddress failover_IP(192, 168, 1, 202);
+IPAddress failover_VIP(192, 168, 1, 254);
+
 IPAddress internet_IP1(1, 1, 1, 1);
 IPAddress internet_IP2(8, 8, 8, 8);
 
@@ -112,6 +130,11 @@ unsigned long lastTgPoll        = 0;
 unsigned long flashTimer        = 0;
 bool          flashState        = false;
 bool          firstCycleDone    = false;
+
+// failover reports: written by the web task, acted on by loop()
+volatile uint8_t failoverPending = 0;   // 0 none, 1 went on, 2 went off
+volatile bool    failoverActive  = false;
+volatile time_t  failoverSince   = 0;
 
 int      failedServerPings = 0;
 bool     serverUp          = true;
@@ -322,6 +345,7 @@ String buildStatus() {
 
   s += "Server " + server_IP.toString() + ": " + String(serverUp ? "UP" : "DOWN");
   if (!serverUp) s += " since " + fmtTime(serverDownAt);
+  if (failoverActive) s += "\nFailover: iMac is answering 443 since " + fmtTime(failoverSince);
   s += "\n\nSites:\n";
 
   for (uint8_t i = 0; i < SITE_COUNT; i++) {
@@ -337,6 +361,36 @@ String buildStatus() {
     s += "\n";
   }
   return s;
+}
+
+// Fetch the server's own status text. Returns a message either way, so the
+// caller can hand it straight to Telegram.
+String fetchServerStatus() {
+  if (WiFi.status() != WL_CONNECTED) return "Cannot reach the server: WiFi is down.";
+
+  WiFiClient client;
+  HTTPClient http;
+  http.setConnectTimeout(SERVER_STATUS_TIMEOUT_MS);
+  http.setTimeout(SERVER_STATUS_TIMEOUT_MS);
+  http.setUserAgent("ESP32-Pinger/2.0");
+
+  uint32_t t0 = millis();
+  if (!http.begin(client, SERVER_STATUS_URL)) return "Cannot reach the server: HTTP client failed to start.";
+  int code = http.GET();
+  String body = (code == 200) ? http.getString() : "";
+  http.end();
+  uint32_t ms = millis() - t0;
+  Serial.printf("[%s] server status -> code %d (%lu ms)\n", code == 200 ? "+" : "-", code, (unsigned long)ms);
+
+  if (code != 200) {
+    String why = (code > 0) ? ("HTTP " + String(code)) : "no response / connection refused";
+    return "SERVER DETAILS unavailable (" + why + " after " + String(ms) + " ms)\n\n"
+           "The LAN server (" + server_IP.toString() + ") is " + String(serverUp ? "answering pings" : "NOT answering pings") +
+           ". If it is up, check the server-status timer and the nginx LAN vhost on it.";
+  }
+  body.trim();
+  if (body.length() > SERVER_STATUS_MAX_CHARS) body = body.substring(0, SERVER_STATUS_MAX_CHARS) + "\n[...]";
+  return "SERVER DETAILS (fetched in " + String(ms) + " ms)\n\n" + body;
 }
 
 // ================================================================ checks
@@ -489,6 +543,10 @@ String helpText() {
     "    Current state: uptime, boot count, outage totals, per-site\n"
     "    availability, WiFi signal and free heap.\n"
     "\n"
+    "/server\n"
+    "    Details from the server itself: uptime, load, temperature,\n"
+    "    memory, disks, RAID, containers, failed services.\n"
+    "\n"
     "/check\n"
     "    Run a check cycle immediately instead of waiting for the\n"
     "    next one, which can be up to a minute away.\n"
@@ -500,7 +558,8 @@ String helpText() {
     "    This message.\n"
     "\n"
     "Alerts are sent on their own when a site or the server goes down\n"
-    "or recovers, when the internet drops, and after a power cut.";
+    "or recovers, when the internet drops, after a power cut, and when\n"
+    "the iMac takes over or hands back port 443.";
 }
 
 void handleCommand(const String &cmd) {
@@ -508,6 +567,8 @@ void handleCommand(const String &cmd) {
 
   if (cmd.startsWith("/status") || cmd.startsWith("/uptime")) {
     notify("STATUS\n\n" + buildStatus());
+  } else if (cmd.startsWith("/server")) {
+    notify(fetchServerStatus());
   } else if (cmd.startsWith("/check")) {
     notify("Running a check cycle now...");
     lastPingTime = millis() - PING_INTERVAL; // force the next loop() to run one
@@ -767,6 +828,74 @@ void runCheckCycle() {
   Serial.println("[*] ===== cycle done =====\n");
 }
 
+// ================================================================ failover reports
+
+#if ENABLE_FAILOVER_API
+// The iMac (mhs-failover) posts here when it takes 192.168.1.254 -- the router's
+// 443 target -- and when it gives it back. Like OTA, this is served from its
+// own task on core 0, because loop() can sit in check timeouts for a minute.
+// The handler only records the change; loop() sends the Telegram message, so
+// two TLS clients never run at once.
+WebServer web(80);
+
+void handleFailover() {
+  IPAddress from = web.client().remoteIP();
+  if (from != failover_IP && from != failover_VIP) {
+    web.send(403, "text/plain", "forbidden\n");
+    return;
+  }
+  if (web.method() != HTTP_POST) {
+    web.send(405, "text/plain", "POST only\n");
+    return;
+  }
+  String st = web.arg("state");
+  if (st == "on") {
+    if (!failoverActive) { failoverActive = true; failoverSince = nowEpoch(); failoverPending = 1; }
+  } else if (st == "off") {
+    if (failoverActive)  { failoverActive = false; failoverPending = 2; }
+  } else {
+    web.send(400, "text/plain", "state must be on or off\n");
+    return;
+  }
+  web.send(200, "text/plain", "ok\n");
+}
+
+void webTask(void* param) {
+  for (;;) {
+    web.handleClient();
+    vTaskDelay(pdMS_TO_TICKS(10));
+  }
+}
+
+void startWeb() {
+  static bool started = false;
+  if (started) return;
+  started = true;
+  web.on("/failover", handleFailover);
+  web.onNotFound([]() { web.send(404, "text/plain", "not found\n"); });
+  web.begin();
+  xTaskCreatePinnedToCore(webTask, "webTask", 6144, nullptr, 1, nullptr, 0);
+  Serial.println("[+] Failover endpoint ready: http://" + WiFi.localIP().toString() + "/failover");
+}
+
+void handleFailoverPending() {
+  uint8_t p = failoverPending;
+  if (!p) return;
+  failoverPending = 0;
+  if (p == 1) {
+    notify("FAILOVER ON: the iMac is answering 443\n\n"
+           "Since: " + fmtTime(failoverSince) + "\n"
+           "mainhomeserver failed its web check and gave up 192.168.1.254, so visitors\n"
+           "to the grey-clouded sites now get the \"temporarily down\" page from the iMac.\n"
+           "dllmch.org, www, tools and mc get it from the Cloudflare Worker.");
+  } else {
+    notify("FAILOVER OFF: 443 is back on mainhomeserver\n\n"
+           "The iMac handed 192.168.1.254 back at " + fmtTime(nowEpoch()) + ".\n"
+           "Failed over since " + fmtTime(failoverSince) + ".");
+  }
+}
+#endif  // ENABLE_FAILOVER_API
+
 // ================================================================ boot tasks
 
 #if ENABLE_OTA
@@ -900,6 +1029,9 @@ void setup() {
     syncTime(10000);
 
     startOTA();
+#if ENABLE_FAILOVER_API
+    startWeb();
+#endif
     doBootReportIfPending();
     currentState = WIFI_CONNECTED_IDLE;
   } else {
@@ -922,6 +1054,10 @@ void loop() {
 
   if (WiFi.status() == WL_CONNECTED) {
     startOTA();
+#if ENABLE_FAILOVER_API
+    startWeb();
+    handleFailoverPending();
+#endif
     doBootReportIfPending();
     flushAlertQueue();
 #if ENABLE_TG_COMMANDS

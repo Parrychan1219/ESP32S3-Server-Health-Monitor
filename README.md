@@ -28,6 +28,8 @@ An RGB LED on the board shows the current state at a glance.
   roughly how long it was dark.
 - **Boot report** — reset reason, boot count, and what it is now watching.
 - **Daily digest** at 09:00 — uptime, outage count, per-site availability.
+- **Failover on / off** — when the iMac takes over port 443 from the server
+  (and when it hands it back). The iMac reports it; see below.
 
 Alerts raised while the connection is down are queued (up to 12) and sent once
 it comes back, so an outage never swallows its own notification.
@@ -164,9 +166,15 @@ binaries that are in fact blocked, so do not trust it as a check.
 | Command | Does |
 |---|---|
 | `/status` | Uptime, boot count, outage totals, per-site availability, RSSI, free heap |
+| `/server` | Details from the server itself — uptime, load, CPU temperature, memory, disks, RAID, containers, failed services, power estimate. Fetched over the LAN from `http://192.168.1.200/pinger/status.txt`, which the server regenerates every minute (see its manual, §9) |
 | `/check` | Runs a check cycle immediately instead of waiting for the next one |
 | `/reboot` | Restarts the board |
 | `/help` | Lists the commands and what they do |
+
+The menu Telegram shows when you type `/` is a separate list stored on
+Telegram's side (Bot API `setMyCommands`, or BotFather's `/setcommands`) — the
+firmware does not register it. When a command is added here, add it there too
+(`/server` was added and all five descriptions rewritten to match this table on 2026-09-14).
 
 Anything else — a typo, an unknown slash command, plain text, or a message with
 no text at all such as a sticker — gets a short "not a command" reply pointing
@@ -197,6 +205,19 @@ mains cut normally takes the router down too.
 to core 0. The main loop can block for 20-30 seconds while HTTP checks time
 out, which is long enough for the uploader to give up on the handshake — and
 that is exactly when you want to push a fix.
+
+**Failover reports (added 2026-09-24).** The router forwards 443 to
+`192.168.1.254`, an address the server holds while its nginx is healthy; when it
+is not, the iMac takes the address and serves a "temporarily down" page
+(project `~/Projects/mhs-failover` on the iMac). The iMac has no bot token, so
+it reports each change here with `POST http://192.168.1.220/failover?state=on`
+or `state=off`, and the board sends the Telegram message. Only `192.168.1.202`
+and `.254` are accepted (403 otherwise), and only a change of state produces a
+message, so a repeated report is harmless. Like OTA, the endpoint is served
+from its own task on core 0; the handler only records the change and `loop()`
+sends the message, so two TLS clients never run at once. While failed over,
+`/status` shows a `Failover:` line. The board is **not** part of the failover
+decision -- if it is offline the takeover still happens, only the message is lost.
 
 ## Configuration reference
 

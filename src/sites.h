@@ -43,7 +43,7 @@ SITE("dllmch.org", "https://dllmch.org/") // same as www.dllmch.org
 SITE("cdn.dllmch.org", "https://cdn.dllmch.org/") // This is the obfuscation subdomain for VPN
 SITE("cloud.dllmch.org", "https://cloud.dllmch.org/")
 SITE("crossplay.mc.dllmch.org", "https://crossplay.mc.dllmch.org/")
-SITE("share.dllmch.org", "https://share.dllmch.org/")
+SITE("file.dllmch.org", "https://file.dllmch.org/") // was share.dllmch.org until 2026-09-14
 
 SITE("moodle.sy19.org",   "https://moodle.sy19.org/")
 
