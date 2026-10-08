@@ -17,6 +17,7 @@ An RGB LED on the board shows the current state at a glance.
 | Internet | Ping `1.1.1.1` and `8.8.8.8` | Outage start, duration, recovery |
 | WiFi | Association state | Folded into the internet outage report |
 | Mains power | NVS heartbeat + reset reason | Reported on the next boot |
+| The server's `service-health-monitor` | Its heartbeat file over LAN HTTP, 2 strikes | Down / up, and "server alerts blocked" when it cannot send |
 
 ## Alerts it sends
 
@@ -30,6 +31,10 @@ An RGB LED on the board shows the current state at a glance.
 - **Daily digest** at 09:00 — uptime, outage count, per-site availability.
 - **Failover on / off** — when the iMac takes over port 443 from the server
   (and when it hands it back). The iMac reports it; see below.
+- **Health monitor down / up** — the server's own service monitor stopped,
+  hung, or its heartbeat page does not answer; and when it is back.
+- **Server alerts blocked / flowing again** — the monitor runs, but has not
+  been able to send through the server's Telegram bot for 15 minutes.
 
 Alerts raised while the connection is down are queued (up to 12) and sent once
 it comes back, so an outage never swallows its own notification.
@@ -226,6 +231,29 @@ sends the message, so two TLS clients never run at once. While failed over,
 `/status` shows a `Failover:` line. The board is **not** part of the failover
 decision -- if it is offline the takeover still happens, only the message is lost.
 
+**Watching the server's service monitor (added 2026-10-09).** The server runs
+`service-health-monitor`, which alerts through the server's *own* bot when a
+service dies or slows down. Nothing on the server can report that monitor's own
+death, so this board does. Each cycle it reads
+`http://192.168.1.200/pinger/health-monitor.txt` (same LAN-only vhost as
+`/server`), a `key=value` file the monitor rewrites every 15 s: `updated=`,
+`state=ok|problems|stopped`, `problems=`, `outbox=`, `tg_fail_since=`. Two bad
+cycles in a row (heartbeat older than 150 s, `state=stopped`, or the page not
+answering) send **HEALTH MONITOR DOWN**. A `tg_fail_since` older than 15 min
+sends **SERVER ALERTS BLOCKED**. The check is skipped while the server is down
+(that alert already covers it) and for 5 min after it comes back, so a reboot
+has time to start the monitor. Age is the board's NTP clock against the
+server's `updated=`; both are NTP-synced, and the margin is minutes. `/status`
+shows a `Health monitor:` line. The server's monitor in turn probes this board
+(`http://192.168.1.220/`), so each one watches the other.
+
+**`GET /state` (added 2026-10-09)** answers LAN clients only (`192.168.1.x`)
+with plain `key=value` text: uptime, server/monitor state, and the title of the
+last Telegram message and whether Telegram accepted it. It exists so the server
+side can test the board end to end without a USB cable. It holds no secrets and
+reads only integers and a spinlock-guarded buffer, never a `String` that
+`loop()` changes on the other core.
+
 ## Configuration reference
 
 Tunables live near the top of `src/main.cpp`:
@@ -241,6 +269,10 @@ Tunables live near the top of `src/main.cpp`:
 | `TZ_INFO` | `HKT-8` | POSIX timezone string |
 | `DIGEST_HOUR` | 9 | Hour for the daily report |
 | `TG_POLL_MS` | 5 s | How often Telegram is polled for commands |
+| `MONITOR_STALE_SEC` | 150 s | Heartbeat age at which the server's monitor counts as dead |
+| `MONITOR_FAIL_STRIKES` | 2 | Bad cycles before "HEALTH MONITOR DOWN" |
+| `MONITOR_GRACE_MS` | 5 min | No monitor check this soon after the server comes back |
+| `MONITOR_TG_FAIL_SEC` | 15 min | Monitor alive but unable to send this long = "alerts blocked" |
 
 Keep the site list under about six entries, or a cycle full of timeouts will
 run past the next cycle.

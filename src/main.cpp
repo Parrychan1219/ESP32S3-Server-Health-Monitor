@@ -10,6 +10,9 @@
  *  - Telegram commands: /status /server /check /reboot
  *  - /server relays a status text the LAN server regenerates every minute
  *  - Relays iMac failover on/off reports (POST /failover, LAN) to Telegram
+ *  - Watches the server's own service-health-monitor through its heartbeat
+ *    file, and says so here when it stops (it alerts through the server's
+ *    bot, so if it dies nothing else would tell you)
  *  - Daily digest, OTA updates
  */
 
@@ -56,6 +59,17 @@ IPAddress server_IP(192, 168, 1, 200);
 const char*    SERVER_STATUS_URL        = "http://192.168.1.200/pinger/status.txt";
 const uint16_t SERVER_STATUS_TIMEOUT_MS = 5000;
 const uint16_t SERVER_STATUS_MAX_CHARS  = 1500;   // Telegram GET URL stays sane
+// The server's service-health-monitor rewrites this every 15 s (same LAN vhost
+// as status.txt). It holds key=value lines: updated=<epoch> state=ok|problems|
+// stopped problems=<n> outbox=<n> tg_fail_since=<epoch or 0>. This board is the
+// watcher of that watcher: it alerts here, through its own bot, because the
+// monitor's alerts go through the server's sendtg, which cannot report its own
+// death.
+const char*    MONITOR_URL          = "http://192.168.1.200/pinger/health-monitor.txt";
+const uint32_t MONITOR_STALE_SEC    = 150;    // heartbeat older than this = hung or dead
+const uint8_t  MONITOR_FAIL_STRIKES = 2;      // bad cycles in a row before "DOWN"
+const uint32_t MONITOR_GRACE_MS     = 300000; // after the server returns: let it boot
+const uint32_t MONITOR_TG_FAIL_SEC  = 900;    // monitor alive but sendtg failing this long
 // The iMac that stands in for the server on 443 (mhs-failover). It reports each
 // takeover and hand-back with POST /failover?state=on|off; only it may.
 // .254 is the shared 443 address, which it holds while failed over.
@@ -139,6 +153,24 @@ int      failedServerPings = 0;
 bool     serverUp          = true;
 time_t   serverDownAt      = 0;
 uint32_t serverDownAtMs    = 0;
+uint32_t serverBackAtMs    = 0;      // when pings resumed after an outage
+
+// the server's service-health-monitor, seen through its heartbeat
+bool     monitorUp         = true;
+uint8_t  monitorFails      = 0;
+time_t   monitorDownAt     = 0;
+uint32_t monitorDownAtMs   = 0;
+String   monitorWhy        = "";
+String   monitorLine       = "not checked yet";
+bool     monitorTgAlerted  = false;
+
+// What GET /state reports. Written by loop() on core 1, read by the web task
+// on core 0: only plain integers, plus one char buffer copied under a
+// spinlock -- never a String, which two cores must not share.
+portMUX_TYPE stateMux = portMUX_INITIALIZER_UNLOCKED;
+volatile uint32_t notifySeq      = 0;
+volatile bool     lastNotifySent = false;
+char              lastNotifyTitle[72] = "";
 
 // connectivity outage bookkeeping
 bool     netDown        = false;
@@ -331,9 +363,21 @@ bool sendTelegramNow(const String &message) {
 String  alertQueue[ALERT_QUEUE_SIZE];
 uint8_t qHead = 0, qCount = 0;
 
+void recordNotify(const String &msg, bool sent) {
+  int nl = msg.indexOf('\n');
+  String title = (nl < 0) ? msg : msg.substring(0, nl);
+  portENTER_CRITICAL(&stateMux);
+  strlcpy(lastNotifyTitle, title.c_str(), sizeof(lastNotifyTitle));
+  lastNotifySent = sent;
+  notifySeq++;
+  portEXIT_CRITICAL(&stateMux);
+}
+
 void notify(const String &msg) {
   Serial.println("---- TELEGRAM ----\n" + msg + "\n------------------");
-  if (sendTelegramNow(msg)) return;
+  bool sent = sendTelegramNow(msg);
+  recordNotify(msg, sent);
+  if (sent) return;
 
   if (qCount == ALERT_QUEUE_SIZE) {          // drop the oldest
     qHead = (qHead + 1) % ALERT_QUEUE_SIZE;
@@ -368,6 +412,7 @@ String buildStatus() {
   s += "Server " + server_IP.toString() + ": " + String(serverUp ? "UP" : "DOWN");
   if (!serverUp) s += " since " + fmtTime(serverDownAt);
   if (failoverActive) s += "\nFailover: iMac is answering 443 since " + fmtTime(failoverSince);
+  s += "\nHealth monitor: " + String(monitorUp ? "" : "DOWN since " + fmtTime(monitorDownAt) + " -- ") + monitorLine;
   s += "\n\nSites:\n";
 
   for (uint8_t i = 0; i < SITE_COUNT; i++) {
@@ -416,6 +461,118 @@ String fetchServerStatus() {
 }
 
 // ================================================================ checks
+
+// One "key=value" line from the heartbeat body, or "" if absent.
+String hbField(const String &body, const char* key) {
+  String k = String(key) + "=";
+  int i = body.startsWith(k) ? 0 : body.indexOf("\n" + k);
+  if (i < 0) return "";
+  if (i > 0) i++;                       // skip the newline
+  int e = body.indexOf('\n', i);
+  return body.substring(i + k.length(), e < 0 ? body.length() : e);
+}
+
+// Returns true if the heartbeat looks healthy; sets why (for alerts) and
+// monitorLine (for /status) either way.
+bool fetchMonitorHeartbeat(String &why) {
+  WiFiClient client;
+  HTTPClient http;
+  http.setConnectTimeout(SERVER_STATUS_TIMEOUT_MS);
+  http.setTimeout(SERVER_STATUS_TIMEOUT_MS);
+  http.setUserAgent("ESP32-Pinger/2.0");
+  if (!http.begin(client, MONITOR_URL)) { why = "HTTP client failed to start"; monitorLine = why; return false; }
+  int code = http.GET();
+  String body = (code == 200) ? http.getString() : "";
+  http.end();
+
+  if (code != 200) {
+    why = "its heartbeat page does not answer (" +
+          String(code > 0 ? "HTTP " + String(code) : String("no response")) +
+          "). Either the monitor never wrote it, or nginx on the server is down.";
+    monitorLine = "heartbeat unreadable (" + String(code) + ")";
+    return false;
+  }
+  String state   = hbField(body, "state");
+  long   updated = hbField(body, "updated").toInt();
+  long   probs   = hbField(body, "problems").toInt();
+  long   tgFail  = hbField(body, "tg_fail_since").toInt();
+  long   outbox  = hbField(body, "outbox").toInt();
+
+  // The alert path of the server: the monitor is alive but sendtg fails.
+  if (clockOK() && tgFail > 0 && nowEpoch() - tgFail > (long)MONITOR_TG_FAIL_SEC) {
+    if (!monitorTgAlerted) {
+      monitorTgAlerted = true;
+      notify("SERVER ALERTS BLOCKED\n\n"
+             "service-health-monitor on mainhomeserver runs, but it cannot send its alerts "
+             "through sendtg (the server's Telegram bot) since " + fmtTime((time_t)tgFail) + ".\n"
+             "Alerts waiting: " + String(outbox) + "\n\n"
+             "Problems it sees now: " + String(probs) + ". Ask /server for details.");
+    }
+  } else if (monitorTgAlerted && tgFail == 0) {
+    monitorTgAlerted = false;
+    notify("SERVER ALERTS FLOWING AGAIN\n\nservice-health-monitor can send through sendtg again; "
+           "the alerts it held are delivered now.");
+  }
+
+  if (state == "stopped") {
+    why = "it was stopped (state=stopped: a clean exit, e.g. systemctl stop), and nothing started it again.";
+    monitorLine = "STOPPED";
+    return false;
+  }
+  if (clockOK() && updated > (long)MIN_EPOCH) {
+    long age = (long)nowEpoch() - updated;
+    if (age > (long)MONITOR_STALE_SEC) {
+      why = "its heartbeat is " + fmtDur((uint32_t)age) + " old (last beat " + fmtTime((time_t)updated) +
+            "). It hung or crashed, and systemd did not bring it back.";
+      monitorLine = "heartbeat " + fmtDur((uint32_t)age) + " old";
+      return false;
+    }
+    monitorLine = String(state == "ok" ? "OK" : "running") + ", beat " + String(age < 0 ? 0 : age) +
+                  "s ago, " + String(probs) + " open problem" + String(probs == 1 ? "" : "s");
+  } else {
+    monitorLine = "running (clock not synced, age unknown)";
+  }
+  return true;
+}
+
+void checkMonitor() {
+  // The server being down is already its own alert; and right after it comes
+  // back, give the boot time to start the monitor before judging it.
+  if (!serverUp || failedServerPings > 0) return;
+  if (serverBackAtMs && millis() - serverBackAtMs < MONITOR_GRACE_MS) return;
+
+  String why;
+  bool ok = fetchMonitorHeartbeat(why);
+  Serial.printf("[%s] health monitor -> %s\n", ok ? "+" : "-", monitorLine.c_str());
+
+  if (ok) {
+    if (!monitorUp) {
+      monitorUp = true;
+      uint32_t dur = monitorDownAtMs ? (millis() - monitorDownAtMs) / 1000 : 0;
+      notify("HEALTH MONITOR UP: service-health-monitor\n\n"
+             "Recovered: " + fmtTime(nowEpoch()) + "\n"
+             "Went down: " + fmtTime(monitorDownAt) + "\n"
+             "Down for:  " + fmtDur(dur) + "\n"
+             "Now: " + monitorLine + ".\n\n"
+             "It sends its own alerts again. Anything that broke while it was down is "
+             "reported by it now only if it is still broken.");
+    }
+    monitorFails = 0;
+    return;
+  }
+  monitorFails++;
+  if (monitorFails == 1) { monitorDownAt = nowEpoch(); monitorDownAtMs = millis(); }
+  if (monitorUp && monitorFails >= MONITOR_FAIL_STRIKES) {
+    monitorUp  = false;
+    monitorWhy = why;
+    notify("HEALTH MONITOR DOWN: service-health-monitor\n\n"
+           "The server answers pings, but its service monitor is not working: " + why + "\n\n"
+           "First failed: " + fmtTime(monitorDownAt) + "\n"
+           "Confirmed:    " + fmtTime(nowEpoch()) + " after " + String(monitorFails) + " checks\n\n"
+           "Until it is back, nothing tells you when a service on the server dies or slows down.\n"
+           "On the server: systemctl status service-health-monitor");
+  }
+}
 
 bool checkInternet() {
   return Ping.ping(internet_IP1, 1) || Ping.ping(internet_IP2, 1);
@@ -523,7 +680,7 @@ void sendBootReport() {
   }
 
   m += "\n\nWatching " + String(SITE_COUNT) + " site(s) + server " + server_IP.toString() +
-       ", every " + String(PING_INTERVAL / 1000) + "s.";
+       " + its service-health-monitor, every " + String(PING_INTERVAL / 1000) + "s.";
   notify(m);
 }
 
@@ -580,8 +737,9 @@ String helpText() {
     "    This message.\n"
     "\n"
     "Alerts are sent on their own when a site or the server goes down\n"
-    "or recovers, when the internet drops, after a power cut, and when\n"
-    "the iMac takes over or hands back port 443.";
+    "or recovers, when the internet drops, after a power cut, when\n"
+    "the iMac takes over or hands back port 443, and when the server's\n"
+    "service-health-monitor stops or cannot send its own alerts.";
 }
 
 void handleCommand(const String &cmd) {
@@ -803,6 +961,7 @@ void runCheckCycle() {
   Serial.println("[*] Pinging Server...");
   if (Ping.ping(server_IP, 1)) {
     if (failedServerPings >= SERVER_FAIL_STRIKES) {
+      serverBackAtMs = millis();
       uint32_t dur = serverDownAtMs ? (millis() - serverDownAtMs) / 1000 : 0;
       String m  = "SERVER UP: mainhomeserver\n\n";
              m += "Recovered: " + fmtTime(nowEpoch()) + "\n";
@@ -837,6 +996,9 @@ void runCheckCycle() {
       }
     }
   }
+
+  // ---- the server's own service monitor ----
+  checkMonitor();
 
   // ---- public sites ----
   bool anySiteDown = false;
@@ -885,6 +1047,30 @@ void handleFailover() {
   web.send(200, "text/plain", "ok\n");
 }
 
+// Read-only state for the LAN, so the server side can test this board's
+// monitor watch end to end (did it notice, and did Telegram take the alert?)
+// without a USB cable. No secrets in it.
+void handleState() {
+  IPAddress from = web.client().remoteIP();
+  if (from[0] != 192 || from[1] != 168 || from[2] != 1) {
+    web.send(403, "text/plain", "forbidden\n");
+    return;
+  }
+  char title[sizeof(lastNotifyTitle)];
+  portENTER_CRITICAL(&stateMux);
+  memcpy(title, lastNotifyTitle, sizeof(title));
+  uint32_t seq = notifySeq;
+  bool sent = lastNotifySent;
+  portEXIT_CRITICAL(&stateMux);
+  char buf[320];
+  snprintf(buf, sizeof(buf),
+           "uptime_s=%lu\nserver_up=%d\nmonitor_up=%d\nmonitor_fails=%u\n"
+           "notify_seq=%lu\nlast_notify=%s\nlast_notify_sent=%d\nqueued=%u\n",
+           (unsigned long)(millis() / 1000), (int)serverUp, (int)monitorUp, (unsigned)monitorFails,
+           (unsigned long)seq, title, (int)sent, (unsigned)qCount);
+  web.send(200, "text/plain", buf);
+}
+
 void webTask(void* param) {
   for (;;) {
     web.handleClient();
@@ -897,6 +1083,7 @@ void startWeb() {
   if (started) return;
   started = true;
   web.on("/failover", handleFailover);
+  web.on("/state", HTTP_GET, handleState);
   web.onNotFound([]() { web.send(404, "text/plain", "not found\n"); });
   web.begin();
   xTaskCreatePinnedToCore(webTask, "webTask", 6144, nullptr, 1, nullptr, 0);
