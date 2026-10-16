@@ -165,6 +165,11 @@ binaries that are in fact blocked, so do not trust it as a check.
 | 🟣 Purple | Internet down, WiFi up |
 | 🔵 Blue (slow) | One or more sites are down, internet up |
 | 🔵 Blue (fast) | OTA update in progress |
+| 🟠 Orange (slow) | The server reports a WARNING while this board itself sees green |
+
+Orange is shown only in place of green. Every other state keeps its colour and
+wins over orange. It needs a good `level_server=warning` read that is at most
+120 s old; `caution` stays green. The board sends no Telegram message for it.
 
 The LED is driven by its own FreeRTOS task on core 0, not by the main loop, so
 it keeps its rhythm while a check cycle is stuck in a timeout. The blink phase
@@ -254,6 +259,27 @@ side can test the board end to end without a USB cable. It holds no secrets and
 reads only integers and a spinlock-guarded buffer, never a `String` that
 `loop()` changes on the other core.
 
+**`GET /state.json` (added 2026-10-16)** answers LAN clients only (`192.168.1.x`,
+else 403) with one JSON object and the headers `Access-Control-Allow-Origin: *`
+and `Cache-Control: no-store`: `v`, `uptime_s`, `now` (epoch, 0 if the clock is
+not synced), `wifi_rssi`, `internet`, `server_up`, `monitor_up`, `led` (the
+current state as text, for example `site_down` or `server_warning`), `cycle_ts`
+(epoch when the last cycle ended), `verdict_level`, `verdict_age_s` and one
+entry per site (`name`, `up`, `code`, `fails`, `down_since`). It holds no
+secrets. `loop()` copies the values into separate variables under the spinlock
+(`publishState`); the web task reads only those copies. The wall page and the
+server's `wall-status.py` read it. `/state` is unchanged.
+
+**Reading the server's verdict (added 2026-10-16).** The server writes its
+combined verdict to `http://192.168.1.200/pinger/verdict.txt` every 5 s
+(`key=value` lines, then `---` and the items). The board reads only
+`level_server=` (`normal`, `caution` or `warning`, which leaves out this
+board's own reports) and `ts=`, with a 2 s timeout, at most every 15 s while
+`loop()` is idle between cycles and once at the end of each cycle. It skips the
+read while WiFi is down, while the server looks down, and during OTA. A failed
+read changes nothing and sends nothing. `/status` shows a
+`Server verdict: <level> (<age> s ago)` line.
+
 ## Configuration reference
 
 Tunables live near the top of `src/main.cpp`:
@@ -273,6 +299,9 @@ Tunables live near the top of `src/main.cpp`:
 | `MONITOR_FAIL_STRIKES` | 2 | Bad cycles before "HEALTH MONITOR DOWN" |
 | `MONITOR_GRACE_MS` | 5 min | No monitor check this soon after the server comes back |
 | `MONITOR_TG_FAIL_SEC` | 15 min | Monitor alive but unable to send this long = "alerts blocked" |
+| `VERDICT_TIMEOUT_MS` | 2 s | Timeout for the `verdict.txt` read |
+| `VERDICT_POLL_MS` | 15 s | Shortest time between idle `verdict.txt` reads |
+| `VERDICT_MAX_AGE_SEC` | 120 s | A `warning` read older than this no longer turns the LED orange |
 
 Keep the site list under about six entries, or a cycle full of timeouts will
 run past the next cycle.

@@ -70,6 +70,13 @@ const uint32_t MONITOR_STALE_SEC    = 150;    // heartbeat older than this = hun
 const uint8_t  MONITOR_FAIL_STRIKES = 2;      // bad cycles in a row before "DOWN"
 const uint32_t MONITOR_GRACE_MS     = 300000; // after the server returns: let it boot
 const uint32_t MONITOR_TG_FAIL_SEC  = 900;    // monitor alive but sendtg failing this long
+// The server (wall-status.py) writes its combined verdict here every 5 s. Only
+// level_server= (the verdict without this board's own reports) and ts= are read.
+// An orange LED means the server reports a WARNING while this board sees green.
+const char*    VERDICT_URL          = "http://192.168.1.200/pinger/verdict.txt";
+const uint16_t VERDICT_TIMEOUT_MS   = 2000;      // short: loop() waits for it
+const uint32_t VERDICT_POLL_MS      = 15000;     // idle reads at most this often
+const uint32_t VERDICT_MAX_AGE_SEC  = 120;       // older than this = ignored
 // The iMac that stands in for the server on 443 (mhs-failover). It reports each
 // takeover and hand-back with POST /failover?state=on|off; only it may.
 // .254 is the shared 443 address, which it holds while failed over.
@@ -120,7 +127,8 @@ enum DeviceState {
   SERVER_DEAD_INTERNET_UP,
   SITE_DOWN_SERVER_UP,
   WIFI_CONNECTED_IDLE,
-  OTA_ACTIVE
+  OTA_ACTIVE,
+  SERVER_REPORTS_WARNING
 };
 // Written by loop() and the OTA callback, read by the LED task on the other core.
 volatile DeviceState currentState = WIFI_DOWN;
@@ -171,6 +179,27 @@ portMUX_TYPE stateMux = portMUX_INITIALIZER_UNLOCKED;
 volatile uint32_t notifySeq      = 0;
 volatile bool     lastNotifySent = false;
 char              lastNotifyTitle[72] = "";
+
+// What GET /state.json reports. loop() owns the plain variables and copies them
+// into the pub* ones under stateMux (publishState); the web task only reads pub*.
+enum VerdictLevel : uint8_t { VL_NONE = 0, VL_NORMAL = 1, VL_CAUTION = 2, VL_WARNING = 3 };
+bool          lastInternetOK  = true;     // this board's own result in the last cycle
+uint32_t      lastCycleTs     = 0;        // epoch when the last cycle ended, 0 = none
+uint8_t       verdictLevel    = VL_NONE;  // last good level_server read
+uint32_t      verdictAtMs     = 0;        // millis() of that read
+bool          verdictRead     = false;    // any good read yet
+long          verdictTs       = 0;        // ts= of that read (server clock)
+uint32_t      lastVerdictTry  = 0;
+
+struct PubSite { bool up; int code; uint8_t fails; uint32_t downSince; };
+PubSite           pubSite[SITE_COUNT];
+bool              pubInternet     = true;
+bool              pubServerUp     = true;
+bool              pubMonitorUp    = true;
+uint32_t          pubCycleTs      = 0;
+uint8_t           pubVerdictLevel = VL_NONE;
+uint32_t          pubVerdictAtMs  = 0;
+bool              pubVerdictRead  = false;
 
 // connectivity outage bookkeeping
 bool     netDown        = false;
@@ -260,6 +289,33 @@ const char* resetReasonStr(esp_reset_reason_t r) {
   }
 }
 
+// ---- the server's verdict, as far as this board's LED is concerned
+const char* verdictName(uint8_t lvl) {
+  switch (lvl) {
+    case VL_NORMAL:  return "normal";
+    case VL_CAUTION: return "caution";
+    case VL_WARNING: return "warning";
+    default:         return "unknown";
+  }
+}
+
+uint32_t verdictAgeSec() { return verdictRead ? (millis() - verdictAtMs) / 1000 : 0; }
+
+// True when the last good read said "warning" and is recent enough to trust.
+bool verdictIsWarning() {
+  return verdictRead && verdictLevel == VL_WARNING && verdictAgeSec() <= VERDICT_MAX_AGE_SEC;
+}
+
+// The state to show when this board itself sees everything fine.
+DeviceState greenState() { return verdictIsWarning() ? SERVER_REPORTS_WARNING : SERVER_UP; }
+
+// Switch only between green and orange; every other state is left alone.
+void applyVerdictToLed() {
+  DeviceState s = currentState;
+  if (s == SERVER_UP && verdictIsWarning())                    currentState = SERVER_REPORTS_WARNING;
+  else if (s == SERVER_REPORTS_WARNING && !verdictIsWarning()) currentState = SERVER_UP;
+}
+
 // ================================================================ LEDs
 // The LED is driven by its own task on core 0 (see ledTask), never by loop().
 // loop() runs on core 1 and can sit in a ping or HTTPS timeout for tens of
@@ -284,6 +340,7 @@ void setLED(DeviceState state, uint8_t r, uint8_t g, uint8_t b) {
 
   if (r == 128 && b == 128) { dim_r = 4; dim_b = 4; }   // purple
   if (r == 255 && g == 255) { dim_r = 4; dim_g = 4; }   // yellow
+  if (r == 255 && g == 80)  { dim_r = 8; dim_g = 2; }   // orange (not yellow: green must stay low)
 
   if (state == SERVER_DEAD_INTERNET_UP) {
     writeRGB(r, g, b);          // full brightness, this one matters
@@ -309,6 +366,7 @@ void showState(DeviceState state) {
     case SERVER_DEAD_INTERNET_UP: flash(state, 255, 0, 0, 500);      break; // red flash
     case SITE_DOWN_SERVER_UP:     flash(state, 0, 0, 255, 800);      break; // blue flash
     case OTA_ACTIVE:              flash(state, 0, 0, 255, 120);      break; // fast blue = flashing
+    case SERVER_REPORTS_WARNING:  flash(state, 255, 80, 0, 800);     break; // orange flash = server reports a WARNING
   }
 }
 
@@ -413,6 +471,8 @@ String buildStatus() {
   if (!serverUp) s += " since " + fmtTime(serverDownAt);
   if (failoverActive) s += "\nFailover: iMac is answering 443 since " + fmtTime(failoverSince);
   s += "\nHealth monitor: " + String(monitorUp ? "" : "DOWN since " + fmtTime(monitorDownAt) + " -- ") + monitorLine;
+  s += "\nServer verdict: " + (verdictRead ? String(verdictName(verdictLevel)) + " (" + String(verdictAgeSec()) + " s ago)"
+                                           : String("unknown (never read)"));
   s += "\n\nSites:\n";
 
   for (uint8_t i = 0; i < SITE_COUNT; i++) {
@@ -572,6 +632,74 @@ void checkMonitor() {
            "Until it is back, nothing tells you when a service on the server dies or slows down.\n"
            "On the server: systemctl status service-health-monitor");
   }
+}
+
+// One good read = HTTP 200 and a level_server this board knows. Anything else
+// leaves the last good read untouched and changes nothing else.
+bool fetchVerdict() {
+  WiFiClient client;
+  HTTPClient http;
+  http.setConnectTimeout(VERDICT_TIMEOUT_MS);
+  http.setTimeout(VERDICT_TIMEOUT_MS);
+  http.setUserAgent("ESP32-Pinger/2.0");
+  if (!http.begin(client, VERDICT_URL)) return false;
+  int code = http.GET();
+  String body = (code == 200) ? http.getString() : "";
+  http.end();
+  if (code != 200) {
+    Serial.printf("[-] server verdict -> code %d\n", code);
+    return false;
+  }
+
+  String lvl = hbField(body, "level_server");
+  lvl.trim();
+  uint8_t level = VL_NONE;
+  if      (lvl == "normal")  level = VL_NORMAL;
+  else if (lvl == "caution") level = VL_CAUTION;
+  else if (lvl == "warning") level = VL_WARNING;
+  if (level == VL_NONE) {
+    Serial.println("[-] server verdict -> no valid level_server");
+    return false;
+  }
+  verdictLevel = level;
+  verdictTs    = hbField(body, "ts").toInt();
+  verdictAtMs  = millis();
+  verdictRead  = true;
+  Serial.printf("[+] server verdict -> %s\n", verdictName(level));
+  return true;
+}
+
+// Copy what the web task may show into the pub* variables. Called from loop()
+// only, and only copies plain values inside the critical section.
+void publishState() {
+  portENTER_CRITICAL(&stateMux);
+  pubInternet     = lastInternetOK;
+  pubServerUp     = serverUp;
+  pubMonitorUp    = monitorUp;
+  pubCycleTs      = lastCycleTs;
+  pubVerdictLevel = verdictLevel;
+  pubVerdictAtMs  = verdictAtMs;
+  pubVerdictRead  = verdictRead;
+  for (uint8_t i = 0; i < SITE_COUNT; i++) {
+    const SiteState &st = siteState[i];
+    pubSite[i].up    = st.up;
+    pubSite[i].code  = st.lastCode;
+    pubSite[i].fails = st.fails;
+    pubSite[i].downSince = (!st.up && st.firstFailAt > (time_t)MIN_EPOCH) ? (uint32_t)st.firstFailAt : 0;
+  }
+  portEXIT_CRITICAL(&stateMux);
+}
+
+// Read the verdict when it is due (force = at the end of a cycle). Skipped while
+// the server looks down or WiFi/OTA is busy. A failed read never raises an alert.
+void readVerdict(bool force) {
+  if (otaInProgress || WiFi.status() != WL_CONNECTED) return;
+  if (!serverUp || failedServerPings > 0) return;
+  if (!force && millis() - lastVerdictTry < VERDICT_POLL_MS) return;
+  lastVerdictTry = millis();
+  fetchVerdict();
+  applyVerdictToLed();
+  publishState();
 }
 
 bool checkInternet() {
@@ -940,6 +1068,7 @@ void checkSites(bool &anySiteDown) {
     }
 
     if (!st.up) anySiteDown = true;
+    publishState();
     delay(50);                                 // let the TLS context tear down
   }
 }
@@ -949,10 +1078,14 @@ void runCheckCycle() {
 
   Serial.println("[*] Pinging Internet...");
   if (!checkInternet()) {
+    lastInternetOK = false;
     beginNetOutage("WiFi associated but 1.1.1.1 and 8.8.8.8 both unreachable");
     currentState = NO_INTERNET_WIFI_OK;
+    if (clockOK()) lastCycleTs = (uint32_t)nowEpoch();
+    publishState();
     return;
   }
+  lastInternetOK = true;
   endNetOutage();                              // sends the recovery message if needed
 
   if (!clockOK()) syncTime(5000);
@@ -973,7 +1106,7 @@ void runCheckCycle() {
     serverUp = true;
     // Stay blue while the sites are rechecked below, rather than showing green
     // for the tens of seconds that takes; the end of the cycle settles it.
-    if (currentState != SITE_DOWN_SERVER_UP) currentState = SERVER_UP;
+    if (currentState != SITE_DOWN_SERVER_UP) currentState = greenState();
     Serial.println("[+] Server is alive.");
   } else {
     failedServerPings++;
@@ -1007,11 +1140,16 @@ void runCheckCycle() {
     checkSites(anySiteDown);
   }
 
+  // the server's verdict, once per cycle (idle reads in loop() keep it fresh)
+  readVerdict(true);
+
   // site trouble only colours the LED when the LAN server itself looks fine
   if (serverUp && failedServerPings == 0)
-    currentState = anySiteDown ? SITE_DOWN_SERVER_UP : SERVER_UP;
+    currentState = anySiteDown ? SITE_DOWN_SERVER_UP : greenState();
 
   firstCycleDone = true;
+  if (clockOK()) lastCycleTs = (uint32_t)nowEpoch();
+  publishState();
   Serial.println("[*] ===== cycle done =====\n");
 }
 
@@ -1071,6 +1209,85 @@ void handleState() {
   web.send(200, "text/plain", buf);
 }
 
+// Append s to out as the inside of a JSON string: quote and backslash escaped,
+// control characters dropped.
+static void jsonEscapeAppend(String &out, const char* s) {
+  for (; *s; s++) {
+    char c = *s;
+    if (c == '"' || c == '\\') { out += '\\'; out += c; }
+    else if ((uint8_t)c >= 0x20) out += c;
+  }
+}
+
+static const char* ledName(DeviceState st, bool ota) {
+  if (ota) return "ota";
+  switch (st) {
+    case WIFI_DOWN:               return "wifi_down";
+    case WIFI_CONNECTED_IDLE:     return "wifi_idle";
+    case NO_INTERNET_WIFI_OK:     return "no_internet";
+    case SERVER_UP:               return "server_up";
+    case SERVER_MISSED_LATEST:    return "server_missed";
+    case SERVER_DEAD_INTERNET_UP: return "server_dead";
+    case SITE_DOWN_SERVER_UP:     return "site_down";
+    case OTA_ACTIVE:              return "ota";
+    case SERVER_REPORTS_WARNING:  return "server_warning";
+  }
+  return "wifi_down";
+}
+
+// Machine-readable state for the wall page and the server (interface contract
+// 2026-10-16, part A). LAN only. Everything loop() writes comes from the pub*
+// copies, read under stateMux; the JSON is built afterwards on the heap.
+void handleStateJson() {
+  web.sendHeader("Access-Control-Allow-Origin", "*");
+  web.sendHeader("Cache-Control", "no-store");
+  IPAddress from = web.client().remoteIP();
+  if (from[0] != 192 || from[1] != 168 || from[2] != 1) {
+    web.send(403, "text/plain", "forbidden\n");
+    return;
+  }
+
+  PubSite  sites[SITE_COUNT];
+  bool     internet, srvUp, monUp, vRead;
+  uint32_t cycleTs, vAt, nowMs;
+  uint8_t  vLevel;
+  portENTER_CRITICAL(&stateMux);
+  memcpy(sites, pubSite, sizeof(sites));
+  internet = pubInternet;  srvUp = pubServerUp;  monUp = pubMonitorUp;
+  cycleTs  = pubCycleTs;
+  vLevel   = pubVerdictLevel;  vAt = pubVerdictAtMs;  vRead = pubVerdictRead;
+  nowMs    = millis();
+  portEXIT_CRITICAL(&stateMux);
+
+  long vAge = vRead ? (long)((nowMs - vAt) / 1000) : -1;
+  const char* vName = (vRead && vAge <= (long)VERDICT_MAX_AGE_SEC) ? verdictName(vLevel) : "unknown";
+
+  String j;
+  j.reserve(1200);
+  j += "{\"v\":1,\"uptime_s\":";   j += String((unsigned long)(nowMs / 1000));
+  j += ",\"now\":";                  j += String((unsigned long)(clockOK() ? nowEpoch() : 0));
+  j += ",\"wifi_rssi\":";            j += String((long)WiFi.RSSI());
+  j += ",\"internet\":";             j += internet ? "true" : "false";
+  j += ",\"server_up\":";            j += srvUp ? "true" : "false";
+  j += ",\"monitor_up\":";           j += monUp ? "true" : "false";
+  j += ",\"led\":\"";                j += ledName(currentState, otaInProgress);
+  j += "\",\"cycle_ts\":";           j += String((unsigned long)cycleTs);
+  j += ",\"verdict_level\":\"";      j += vName;
+  j += "\",\"verdict_age_s\":";      j += String(vAge);
+  j += ",\"sites\":[";
+  for (uint8_t i = 0; i < SITE_COUNT; i++) {
+    if (i) j += ',';
+    j += "{\"name\":\"";             jsonEscapeAppend(j, SITES[i].name);
+    j += "\",\"up\":";               j += sites[i].up ? "true" : "false";
+    j += ",\"code\":";               j += String((long)sites[i].code);
+    j += ",\"fails\":";              j += String((long)sites[i].fails);
+    j += ",\"down_since\":";         j += String((unsigned long)sites[i].downSince);
+    j += '}';
+  }
+  j += "]}";
+  web.send(200, "application/json", j);
+}
+
 void webTask(void* param) {
   for (;;) {
     web.handleClient();
@@ -1084,6 +1301,7 @@ void startWeb() {
   started = true;
   web.on("/failover", handleFailover);
   web.on("/state", HTTP_GET, handleState);
+  web.on("/state.json", HTTP_GET, handleStateJson);
   web.onNotFound([]() { web.send(404, "text/plain", "not found\n"); });
   web.begin();
   xTaskCreatePinnedToCore(webTask, "webTask", 6144, nullptr, 1, nullptr, 0);
@@ -1279,7 +1497,11 @@ void loop() {
     if (millis() - lastPingTime >= PING_INTERVAL || !firstCycleDone) {
       lastPingTime = millis();
       runCheckCycle();
+    } else {
+      readVerdict(false);        // idle between cycles: at most every VERDICT_POLL_MS
     }
+    applyVerdictToLed();         // also lets an old "warning" expire after 120 s
+    publishState();
   }
 
   heartbeat();
