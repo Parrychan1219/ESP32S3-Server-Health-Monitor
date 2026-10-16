@@ -259,6 +259,8 @@ side can test the board end to end without a USB cable. It holds no secrets and
 reads only integers and a spinlock-guarded buffer, never a `String` that
 `loop()` changes on the other core.
 
+The exact formats between this board and the wall dashboard ([Dashboard-as-a-Webapp](https://github.com/Parrychan1219/Dashboard-as-a-Webapp), private) are in [INTERFACE.md](INTERFACE.md).
+
 **`GET /state.json` (added 2026-10-16)** answers LAN clients only (`192.168.1.x`,
 else 403) with one JSON object and the headers `Access-Control-Allow-Origin: *`
 and `Cache-Control: no-store`: `v`, `uptime_s`, `now` (epoch, 0 if the clock is
