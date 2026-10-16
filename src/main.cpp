@@ -661,8 +661,14 @@ bool fetchVerdict() {
     Serial.println("[-] server verdict -> no valid level_server");
     return false;
   }
+  // A file that stopped updating (wall-status dead) is not a verdict.
+  long ts = hbField(body, "ts").toInt();
+  if (clockOK() && (ts <= 0 || (long)nowEpoch() - ts > (long)VERDICT_MAX_AGE_SEC)) {
+    Serial.println("[-] server verdict -> stale ts");
+    return false;
+  }
   verdictLevel = level;
-  verdictTs    = hbField(body, "ts").toInt();
+  verdictTs    = ts;
   verdictAtMs  = millis();
   verdictRead  = true;
   Serial.printf("[+] server verdict -> %s\n", verdictName(level));
