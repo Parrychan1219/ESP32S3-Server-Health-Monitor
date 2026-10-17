@@ -10,6 +10,8 @@
  *  - Telegram commands: /status /server /check /reboot
  *  - /server relays a status text the LAN server regenerates every minute
  *  - Relays iMac failover on/off reports (POST /failover, LAN) to Telegram
+ *  - Planned reboot/shutdown signal from the server (POST /power): mutes the
+ *    server-related alerts until it is back
  *  - Watches the server's own service-health-monitor through its heartbeat
  *    file, and says so here when it stops (it alerts through the server's
  *    bot, so if it dies nothing else would tell you)
@@ -31,6 +33,7 @@
 #define ENABLE_TG_COMMANDS  1   // reply to /status /check /reboot in Telegram
 #define ENABLE_DAILY_DIGEST 1
 #define ENABLE_FAILOVER_API 1   // accept failover on/off reports from the iMac
+#define ENABLE_POWER_API    1   // accept the server's planned reboot/shutdown signal
 
 #if ENABLE_OTA
   #include <ArduinoOTA.h>
@@ -77,6 +80,12 @@ const char*    VERDICT_URL          = "http://192.168.1.200/pinger/verdict.txt";
 const uint16_t VERDICT_TIMEOUT_MS   = 2000;      // short: loop() waits for it
 const uint32_t VERDICT_POLL_MS      = 15000;     // idle reads at most this often
 const uint32_t VERDICT_MAX_AGE_SEC  = 120;       // older than this = ignored
+// The verdict also carries power=reboot|shutdown|none (the server's view of a
+// planned power signal, see the mute below). A power=none only ends a mute when
+// the file was written this long after the signal: wall-status needs a few
+// seconds to notice the signal, and until then it still says none.
+const uint32_t POWER_VERDICT_GUARD_SEC = 15;
+const uint32_t POWER_MAX_SEC        = 86400;     // window/settle above this = bad input
 // The iMac that stands in for the server on 443 (mhs-failover). It reports each
 // takeover and hand-back with POST /failover?state=on|off; only it may.
 // .254 is the shared 443 address, which it holds while failed over.
@@ -157,11 +166,39 @@ volatile uint8_t failoverPending = 0;   // 0 none, 1 went on, 2 went off
 volatile bool    failoverActive  = false;
 volatile time_t  failoverSince   = 0;
 
+// planned power signal (POST /power): written by the web task under stateMux,
+// applied by loop() (handlePowerPending)
+volatile uint8_t powerPending     = 0;   // 0 none, 1 reboot, 2 shutdown, 3 clear
+time_t           powerPendingTs   = 0;   // server epoch of the signal (display only)
+uint32_t         powerPendingWin  = 0;   // seconds, as received
+uint32_t         powerPendingSet  = 0;
+bool             powerPendingTest = false;
+
 int      failedServerPings = 0;
 bool     serverUp          = true;
 time_t   serverDownAt      = 0;
 uint32_t serverDownAtMs    = 0;
 uint32_t serverBackAtMs    = 0;      // when pings resumed after an outage
+time_t   lastServerOkAt    = 0;      // last good ping (epoch, 0 = none/unsynced)
+bool     serverDownSentByPower = false;  // SERVER DOWN already sent at a reboot window's end
+uint32_t cycleCount        = 0;      // check cycles started since boot
+
+// Planned reboot/shutdown mute. Owned by loop(); timed with millis() only, as
+// the board clock may be unsynced. Alerts of the muted kinds go through
+// notifyAlert(), which drops them while powerMode != PM_NONE.
+enum PowerMode : uint8_t { PM_NONE = 0, PM_REBOOT = 1, PM_SHUTDOWN = 2 };
+uint8_t  powerMode        = PM_NONE;
+time_t   powerTs          = 0;       // server epoch of the signal (display, verdict ts compare)
+uint32_t powerStartMs     = 0;       // millis() when the POST was applied
+uint32_t powerWindowMs    = 0;       // reboot: longest mute
+uint32_t powerSettleMs    = 0;       // shutdown: server must have pinged this long
+uint32_t powerUntil       = 0;       // epoch the reboot mute ends at the latest, 0 = unknown
+bool     powerTest        = false;
+uint32_t powerPingSinceMs = 0;       // millis() of the first good ping of the current run, 0 = not pinging
+bool     powerDownKnown   = false;   // first outage already measured
+uint32_t powerDownSec     = 0;       // first missed ping -> first good ping
+bool     powerRechecked   = false;   // window ended with no ping: one fresh cycle was forced
+uint32_t powerRecheckCycle = 0;
 
 // the server's service-health-monitor, seen through its heartbeat
 bool     monitorUp         = true;
@@ -189,6 +226,8 @@ uint8_t       verdictLevel    = VL_NONE;  // last good level_server read
 uint32_t      verdictAtMs     = 0;        // millis() of that read
 bool          verdictRead     = false;    // any good read yet
 long          verdictTs       = 0;        // ts= of that read (server clock)
+enum VerdictPower : uint8_t { VP_UNKNOWN = 0, VP_NONE = 1, VP_ACTIVE = 2 };
+uint8_t       verdictPower    = VP_UNKNOWN;  // power= of that read (VP_UNKNOWN = line absent)
 uint32_t      lastVerdictTry  = 0;
 
 struct PubSite { bool up; int code; uint8_t fails; uint32_t downSince; };
@@ -200,6 +239,10 @@ uint32_t          pubCycleTs      = 0;
 uint8_t           pubVerdictLevel = VL_NONE;
 uint32_t          pubVerdictAtMs  = 0;
 bool              pubVerdictRead  = false;
+uint8_t           pubPowerType    = PM_NONE;
+uint32_t          pubPowerTs      = 0;
+uint32_t          pubPowerUntil   = 0;
+bool              pubPowerTest    = false;
 
 // connectivity outage bookkeeping
 bool     netDown        = false;
@@ -240,6 +283,16 @@ String fmtTime(time_t t) {
   localtime_r(&t, &ti);
   char buf[32];
   strftime(buf, sizeof(buf), "%Y-%m-%d %H:%M:%S", &ti);
+  return String(buf);
+}
+
+// HH:MM:SS of an epoch (a server ts or a ping time), for the power messages.
+String fmtHMS(time_t t) {
+  if (t < (time_t)MIN_EPOCH) return "unknown";
+  struct tm ti;
+  localtime_r(&t, &ti);
+  char buf[16];
+  strftime(buf, sizeof(buf), "%H:%M:%S", &ti);
   return String(buf);
 }
 
@@ -446,6 +499,19 @@ void notify(const String &msg) {
   Serial.printf("[*] Queued alert (%u pending).\n", qCount);
 }
 
+// Every alert of a kind the planned power signal mutes (SERVER DOWN/UP, SITE
+// DOWN/UP, HEALTH MONITOR DOWN/UP, SERVER ALERTS BLOCKED/FLOWING AGAIN,
+// FAILOVER ON/OFF) goes through here. While muted it is dropped, not queued.
+// Everything else keeps using notify().
+void notifyAlert(const String &msg) {
+  if (powerMode != PM_NONE) {
+    int nl = msg.indexOf('\n');
+    Serial.println("[*] Muted (power signal): " + (nl < 0 ? msg : msg.substring(0, nl)));
+    return;
+  }
+  notify(msg);
+}
+
 void flushAlertQueue() {
   while (qCount > 0) {
     if (!sendTelegramNow(alertQueue[qHead])) return;   // still offline, try later
@@ -454,6 +520,46 @@ void flushAlertQueue() {
     qCount--;
     delay(250);                                        // be nice to the API
   }
+}
+
+// The text of each muted alert kind that can be repeated when a mute ends
+// while the thing is still down. Shared by the normal path and the mute's end.
+String serverDownMsg(int misses) {
+  String m  = "SERVER DOWN: mainhomeserver\n\n";
+         m += String(misses) + " consecutive pings missed.\n";
+         m += "First miss: " + fmtTime(serverDownAt) + "\n";
+         m += "Confirmed:  " + fmtTime(nowEpoch());
+  return m;
+}
+
+String siteDownMsg(uint8_t i) {
+  const SiteState &st = siteState[i];
+  String why = (st.lastCode > 0) ? ("HTTP " + String(st.lastCode))
+                                 : "no response / connection refused / TLS failure";
+  String m  = "SITE DOWN: " + String(SITES[i].name) + "\n\n";
+         m += String(SITES[i].url) + "\n";
+         m += "First failed: " + fmtTime(st.firstFailAt) + "\n";
+         m += "Confirmed:    " + fmtTime(nowEpoch()) + " after " +
+              String(st.fails) + " tries\n";
+         m += "Reason: " + why;
+  return m;
+}
+
+String monitorDownMsg() {
+  return "HEALTH MONITOR DOWN: service-health-monitor\n\n"
+         "The server answers pings, but its service monitor is not working: " + monitorWhy + "\n\n"
+         "First failed: " + fmtTime(monitorDownAt) + "\n"
+         "Confirmed:    " + fmtTime(nowEpoch()) + " after " + String(monitorFails) + " checks\n\n"
+         "Until it is back, nothing tells you when a service on the server dies or slows down.\n"
+         "On the server: systemctl status service-health-monitor";
+}
+
+String failoverOnMsg() {
+  return "FAILOVER ON: the iMac is answering 443\n\n"
+         "Since: " + fmtTime(failoverSince) + "\n"
+         "mainhomeserver failed its web check and gave up 192.168.1.254, so visitors\n"
+         "to the grey-clouded sites now get the \"temporarily down\" page from the iMac.\n"
+         "dllmch.org, www, tools and mc get it from the Cloudflare Worker.";
 }
 
 // ================================================================ status text
@@ -473,6 +579,9 @@ String buildStatus() {
   s += "\nHealth monitor: " + String(monitorUp ? "" : "DOWN since " + fmtTime(monitorDownAt) + " -- ") + monitorLine;
   s += "\nServer verdict: " + (verdictRead ? String(verdictName(verdictLevel)) + " (" + String(verdictAgeSec()) + " s ago)"
                                            : String("unknown (never read)"));
+  if (powerMode != PM_NONE)
+    s += String("\nPower signal: ") + (powerMode == PM_REBOOT ? "reboot" : "shutdown") + " at " +
+         fmtHMS(powerTs) + ", server alerts muted";
   s += "\n\nSites:\n";
 
   for (uint8_t i = 0; i < SITE_COUNT; i++) {
@@ -562,7 +671,7 @@ bool fetchMonitorHeartbeat(String &why) {
   if (clockOK() && tgFail > 0 && nowEpoch() - tgFail > (long)MONITOR_TG_FAIL_SEC) {
     if (!monitorTgAlerted) {
       monitorTgAlerted = true;
-      notify("SERVER ALERTS BLOCKED\n\n"
+      notifyAlert("SERVER ALERTS BLOCKED\n\n"
              "service-health-monitor on mainhomeserver runs, but it cannot send its alerts "
              "through sendtg (the server's Telegram bot) since " + fmtTime((time_t)tgFail) + ".\n"
              "Alerts waiting: " + String(outbox) + "\n\n"
@@ -570,7 +679,7 @@ bool fetchMonitorHeartbeat(String &why) {
     }
   } else if (monitorTgAlerted && tgFail == 0) {
     monitorTgAlerted = false;
-    notify("SERVER ALERTS FLOWING AGAIN\n\nservice-health-monitor can send through sendtg again; "
+    notifyAlert("SERVER ALERTS FLOWING AGAIN\n\nservice-health-monitor can send through sendtg again; "
            "the alerts it held are delivered now.");
   }
 
@@ -609,7 +718,7 @@ void checkMonitor() {
     if (!monitorUp) {
       monitorUp = true;
       uint32_t dur = monitorDownAtMs ? (millis() - monitorDownAtMs) / 1000 : 0;
-      notify("HEALTH MONITOR UP: service-health-monitor\n\n"
+      notifyAlert("HEALTH MONITOR UP: service-health-monitor\n\n"
              "Recovered: " + fmtTime(nowEpoch()) + "\n"
              "Went down: " + fmtTime(monitorDownAt) + "\n"
              "Down for:  " + fmtDur(dur) + "\n"
@@ -625,12 +734,7 @@ void checkMonitor() {
   if (monitorUp && monitorFails >= MONITOR_FAIL_STRIKES) {
     monitorUp  = false;
     monitorWhy = why;
-    notify("HEALTH MONITOR DOWN: service-health-monitor\n\n"
-           "The server answers pings, but its service monitor is not working: " + why + "\n\n"
-           "First failed: " + fmtTime(monitorDownAt) + "\n"
-           "Confirmed:    " + fmtTime(nowEpoch()) + " after " + String(monitorFails) + " checks\n\n"
-           "Until it is back, nothing tells you when a service on the server dies or slows down.\n"
-           "On the server: systemctl status service-health-monitor");
+    notifyAlert(monitorDownMsg());
   }
 }
 
@@ -667,6 +771,12 @@ bool fetchVerdict() {
     Serial.println("[-] server verdict -> stale ts");
     return false;
   }
+  // power= (part B of the contract): only "none" can end a mute; a file without
+  // the line (older server) is "unknown" and never confirms anything.
+  String pw = hbField(body, "power");
+  pw.trim();
+  verdictPower = (pw == "none") ? VP_NONE
+               : (pw == "reboot" || pw == "shutdown") ? VP_ACTIVE : VP_UNKNOWN;
   verdictLevel = level;
   verdictTs    = ts;
   verdictAtMs  = millis();
@@ -686,6 +796,10 @@ void publishState() {
   pubVerdictLevel = verdictLevel;
   pubVerdictAtMs  = verdictAtMs;
   pubVerdictRead  = verdictRead;
+  pubPowerType    = powerMode;
+  pubPowerTs      = (uint32_t)powerTs;
+  pubPowerUntil   = powerUntil;
+  pubPowerTest    = powerTest;
   for (uint8_t i = 0; i < SITE_COUNT; i++) {
     const SiteState &st = siteState[i];
     pubSite[i].up    = st.up;
@@ -1019,6 +1133,150 @@ void syncTime(uint16_t waitMs) {
                            : "[-] NTP sync failed.");
 }
 
+// ================================================================ planned power signal
+
+// The server announces a planned reboot or shutdown with POST /power (see the
+// handler below). From then on the muted alert kinds are dropped (notifyAlert)
+// until one of the end conditions below holds. Everything else -- checks, state,
+// LED, state.json, internet/WiFi messages -- runs exactly as without a signal.
+// All timing is millis() from the moment the POST was applied: the board clock
+// can be unsynced, and a server ts is only ever displayed.
+
+String powerName(uint8_t m) { return m == PM_REBOOT ? "reboot" : "shutdown"; }
+
+// "0s" when no ping was missed, else a normal duration.
+String fmtDown(uint32_t sec) { return sec == 0 ? String("0s") : fmtDur(sec); }
+
+// Called by the check cycle with every server ping result, before the strike
+// counters change. Measures the first outage (first missed ping -> first good
+// ping) and the unbroken run of good pings that ends a shutdown mute.
+void powerOnPing(bool ok) {
+  if (powerMode == PM_NONE) return;
+  if (ok) {
+    if (failedServerPings > 0 && !powerDownKnown) {
+      powerDownKnown = true;
+      powerDownSec   = serverDownAtMs ? (millis() - serverDownAtMs) / 1000 : 0;
+    }
+    if (!powerPingSinceMs) powerPingSinceMs = millis() | 1;   // |1: never 0 = "not pinging"
+  } else {
+    powerPingSinceMs = 0;
+  }
+}
+
+// The mute is over. back = the server answers pings now.
+void powerEnd(bool back) {
+  uint8_t  mode = powerMode;
+  bool     test = powerTest;
+  time_t   ts   = powerTs;
+  uint32_t down = powerDownKnown ? powerDownSec : 0;
+  powerMode = PM_NONE;
+  powerUntil = 0;
+  publishState();
+
+  if (back) {
+    notify(String(test ? "TEST " : "") + "SERVER BACK after " + powerName(mode) + "\n\n"
+           "Signal: " + fmtHMS(ts) + "\n"
+           "Down for: " + fmtDown(down));
+    // what is down or on NOW; what went down and recovered inside the mute stays silent
+    for (uint8_t i = 0; i < SITE_COUNT; i++)
+      if (!siteState[i].up) notify(siteDownMsg(i));
+    if (!monitorUp) notify(monitorDownMsg());
+    if (failoverActive) notify(failoverOnMsg());
+  } else {
+    // reboot window over, no ping: the normal SERVER DOWN, now. The strike logic
+    // must not send it a second time (serverDownSentByPower), and a later
+    // recovery must send SERVER UP even if it came before the third strike.
+    notify(serverDownMsg(failedServerPings) + "\n\n"
+           "Did not come back after its reboot signal. Last seen " + fmtHMS(lastServerOkAt) +
+           " with reboot signal.");
+    if (failedServerPings < SERVER_FAIL_STRIKES) serverDownSentByPower = true;
+  }
+}
+
+// Checked every loop() pass while WiFi is up.
+void powerTick() {
+  if (powerMode == PM_NONE) return;
+  bool pinging = serverUp && failedServerPings == 0;
+
+  // the server's own word: a fresh read, written well after the signal, says none
+  bool verdictNone = pinging && verdictRead && verdictPower == VP_NONE &&
+                     verdictAgeSec() <= VERDICT_MAX_AGE_SEC &&
+                     verdictTs >= (long)powerTs + (long)POWER_VERDICT_GUARD_SEC;
+  if (verdictNone) { powerEnd(true); return; }
+
+  if (powerMode == PM_SHUTDOWN) {
+    // no limit while the server does not ping
+    if (pinging && powerPingSinceMs && millis() - powerPingSinceMs >= powerSettleMs) powerEnd(true);
+    return;
+  }
+
+  if (millis() - powerStartMs < powerWindowMs) return;
+  if (pinging) { powerEnd(true); return; }
+  // Window over and the last cycle saw no ping (up to a minute old): look once
+  // more before saying so.
+  if (!powerRechecked) {
+    powerRechecked    = true;
+    powerRecheckCycle = cycleCount;
+    lastPingTime      = millis() - PING_INTERVAL;     // the next loop() pass runs a cycle
+    return;
+  }
+  if (cycleCount == powerRecheckCycle) return;        // that cycle has not run yet
+  powerEnd(false);
+}
+
+#if ENABLE_POWER_API
+// Apply what the web task stored: start, replace or clear the mute, and send the
+// announcement (not muted itself).
+void handlePowerPending() {
+  uint8_t  p;
+  time_t   ts;
+  uint32_t win, settle;
+  bool     test;
+  portENTER_CRITICAL(&stateMux);
+  p = powerPending;  ts = powerPendingTs;  win = powerPendingWin;
+  settle = powerPendingSet;  test = powerPendingTest;
+  powerPending = 0;
+  portEXIT_CRITICAL(&stateMux);
+  if (!p) return;
+
+  if (p == 3) {                                       // clear: end at once, say nothing
+    powerMode = PM_NONE;
+    powerUntil = 0;
+    publishState();
+    Serial.println("[*] Power signal cleared.");
+    return;
+  }
+
+  powerMode        = p;                               // a new signal replaces the old one
+  powerTs          = ts;
+  powerTest        = test;
+  powerStartMs     = millis();
+  powerWindowMs    = win * 1000UL;
+  powerSettleMs    = settle * 1000UL;
+  powerUntil       = (p == PM_REBOOT && clockOK()) ? (uint32_t)(ts + (time_t)win) : 0;
+  powerPingSinceMs = (serverUp && failedServerPings == 0) ? (millis() | 1) : 0;
+  powerDownKnown   = false;
+  powerDownSec     = 0;
+  powerRechecked   = false;
+  publishState();
+  Serial.printf("[*] Power signal: %s, window %lu s, settle %lu s%s\n", powerName(p).c_str(),
+                (unsigned long)win, (unsigned long)settle, test ? " (test)" : "");
+
+  String head = test ? "TEST " : "";
+  if (p == PM_REBOOT) {
+    String mins = (win % 60 == 0) ? String(win / 60) + " min" : String(win) + " s";
+    notify(head + "SERVER REBOOTING: mainhomeserver\n\n"
+           "Signal: " + fmtHMS(ts) + "\n"
+           "Alerts muted until " + fmtHMS(ts + (time_t)win) + " at the latest (" + mins +
+           "). If it is not back by then, you get SERVER DOWN.");
+  } else {
+    notify(head + "SERVER SHUTTING DOWN: mainhomeserver\n\n"
+           "Signal: " + fmtHMS(ts) + "\n"
+           "Alerts muted until it is back and settled.");
+  }
+}
+#endif  // ENABLE_POWER_API
+
 // ================================================================ check cycle
 
 void checkSites(bool &anySiteDown) {
@@ -1050,7 +1308,7 @@ void checkSites(bool &anySiteDown) {
                m += "Went down: " + fmtTime(st.firstFailAt) + "\n";
                m += "Down for:  " + fmtDur(dur) + "\n";
                m += "Now answering HTTP " + String(code) + " in " + String(ms) + " ms.";
-        notify(m);
+        notifyAlert(m);
       }
     } else {
       st.oks = 0;
@@ -1061,15 +1319,7 @@ void checkSites(bool &anySiteDown) {
       }
       if (st.up && st.fails >= SITE_FAIL_STRIKES) {
         st.up = false;
-        String why = (code > 0) ? ("HTTP " + String(code))
-                                : "no response / connection refused / TLS failure";
-        String m  = "SITE DOWN: " + String(SITES[i].name) + "\n\n";
-               m += String(SITES[i].url) + "\n";
-               m += "First failed: " + fmtTime(st.firstFailAt) + "\n";
-               m += "Confirmed:    " + fmtTime(nowEpoch()) + " after " +
-                    String(st.fails) + " tries\n";
-               m += "Reason: " + why;
-        notify(m);
+        notifyAlert(siteDownMsg(i));
       }
     }
 
@@ -1081,6 +1331,7 @@ void checkSites(bool &anySiteDown) {
 
 void runCheckCycle() {
   Serial.println("\n[*] ===== check cycle =====");
+  cycleCount++;
 
   Serial.println("[*] Pinging Internet...");
   if (!checkInternet()) {
@@ -1099,22 +1350,26 @@ void runCheckCycle() {
   // ---- LAN server ----
   Serial.println("[*] Pinging Server...");
   if (Ping.ping(server_IP, 1)) {
-    if (failedServerPings >= SERVER_FAIL_STRIKES) {
+    if (failedServerPings >= SERVER_FAIL_STRIKES || serverDownSentByPower) {
       serverBackAtMs = millis();
       uint32_t dur = serverDownAtMs ? (millis() - serverDownAtMs) / 1000 : 0;
       String m  = "SERVER UP: mainhomeserver\n\n";
              m += "Recovered: " + fmtTime(nowEpoch()) + "\n";
              m += "Went down: " + fmtTime(serverDownAt) + "\n";
              m += "Down for:  " + fmtDur(dur);
-      notify(m);
+      notifyAlert(m);
     }
+    powerOnPing(true);
     failedServerPings = 0;
+    serverDownSentByPower = false;
+    lastServerOkAt = clockOK() ? nowEpoch() : 0;
     serverUp = true;
     // Stay blue while the sites are rechecked below, rather than showing green
     // for the tens of seconds that takes; the end of the cycle settles it.
     if (currentState != SITE_DOWN_SERVER_UP) currentState = greenState();
     Serial.println("[+] Server is alive.");
   } else {
+    powerOnPing(false);
     failedServerPings++;
     Serial.printf("[-] Server missed ping. Strike %d\n", failedServerPings);
     if (failedServerPings == 1) {
@@ -1127,11 +1382,8 @@ void runCheckCycle() {
       currentState = SERVER_DEAD_INTERNET_UP;
       if (failedServerPings == SERVER_FAIL_STRIKES) {
         serverUp = false;
-        String m  = "SERVER DOWN: mainhomeserver\n\n";
-               m += String(SERVER_FAIL_STRIKES) + " consecutive pings missed.\n";
-               m += "First miss: " + fmtTime(serverDownAt) + "\n";
-               m += "Confirmed:  " + fmtTime(nowEpoch());
-        notify(m);
+        // a reboot window that ended with the server silent already said so
+        if (!serverDownSentByPower) notifyAlert(serverDownMsg(SERVER_FAIL_STRIKES));
       }
     }
   }
@@ -1161,13 +1413,16 @@ void runCheckCycle() {
 
 // ================================================================ failover reports
 
+#if ENABLE_FAILOVER_API || ENABLE_POWER_API
+WebServer web(80);
+#endif
+
 #if ENABLE_FAILOVER_API
 // The iMac (mhs-failover) posts here when it takes 192.168.1.254 -- the router's
 // 443 target -- and when it gives it back. Like OTA, this is served from its
 // own task on core 0, because loop() can sit in check timeouts for a minute.
 // The handler only records the change; loop() sends the Telegram message, so
 // two TLS clients never run at once.
-WebServer web(80);
 
 void handleFailover() {
   IPAddress from = web.client().remoteIP();
@@ -1190,7 +1445,73 @@ void handleFailover() {
   }
   web.send(200, "text/plain", "ok\n");
 }
+#endif  // ENABLE_FAILOVER_API
 
+#if ENABLE_POWER_API
+// Parse a positive decimal integer of at most 10 digits (no sign, no spaces).
+static bool parsePosInt(const String &in, uint32_t &out) {
+  if (in.length() == 0 || in.length() > 10) return false;
+  uint64_t v = 0;
+  for (size_t i = 0; i < in.length(); i++) {
+    if (!isdigit((uint8_t)in[i])) return false;
+    v = v * 10 + (in[i] - '0');
+  }
+  if (v == 0 || v > 0xFFFFFFFFULL) return false;
+  out = (uint32_t)v;
+  return true;
+}
+
+// POST /power?type=reboot|shutdown|clear&ts=&window=&settle=[&test=1], only from
+// the server (192.168.1.200). Same split as /failover: this only records the
+// request (under stateMux, flag last); loop() starts the mute and sends the
+// Telegram message (handlePowerPending). Contract part F.
+void handlePower() {
+  IPAddress from = web.client().remoteIP();
+  if (from != server_IP) {
+    web.send(403, "text/plain", "forbidden\n");
+    return;
+  }
+  if (web.method() != HTTP_POST) {
+    web.send(405, "text/plain", "POST only\n");
+    return;
+  }
+  String type = web.arg("type");
+  uint8_t  code = 0;
+  uint32_t ts = 0, win = 360, settle = 300;
+  bool test = (web.arg("test") == "1");
+  if (type == "clear") {
+    code = 3;
+  } else if (type == "reboot" || type == "shutdown") {
+    code = (type == "reboot") ? PM_REBOOT : PM_SHUTDOWN;
+    // ts is always needed; the value the type does not use may be left out
+    bool ok = parsePosInt(web.arg("ts"), ts);
+    if (web.hasArg("window") || code == PM_REBOOT) ok = ok && parsePosInt(web.arg("window"), win) && win <= POWER_MAX_SEC;
+    if (web.hasArg("settle") || code == PM_SHUTDOWN) ok = ok && parsePosInt(web.arg("settle"), settle) && settle <= POWER_MAX_SEC;
+    if (!ok) {
+      web.send(400, "text/plain", "ts, window (reboot) and settle (shutdown) must be positive integers\n");
+      return;
+    }
+  } else {
+    web.send(400, "text/plain", "type must be reboot, shutdown or clear\n");
+    return;
+  }
+
+  portENTER_CRITICAL(&stateMux);
+  powerPendingTs   = (time_t)ts;
+  powerPendingWin  = win;
+  powerPendingSet  = settle;
+  powerPendingTest = test;
+  powerPending     = code;
+  portEXIT_CRITICAL(&stateMux);
+
+  uint32_t until = (code == PM_REBOOT && clockOK()) ? ts + win : 0;
+  String j = "{\"ok\":true,\"type\":\"" + type + "\",\"until\":" + String((unsigned long)until) +
+             ",\"test\":" + (test ? "true" : "false") + "}";
+  web.send(200, "application/json", j);
+}
+#endif  // ENABLE_POWER_API
+
+#if ENABLE_FAILOVER_API || ENABLE_POWER_API
 // Read-only state for the LAN, so the server side can test this board's
 // monitor watch end to end (did it notice, and did Telegram take the alert?)
 // without a USB cable. No secrets in it.
@@ -1205,13 +1526,15 @@ void handleState() {
   memcpy(title, lastNotifyTitle, sizeof(title));
   uint32_t seq = notifySeq;
   bool sent = lastNotifySent;
+  uint8_t pw = pubPowerType;
   portEXIT_CRITICAL(&stateMux);
-  char buf[320];
+  char buf[360];
   snprintf(buf, sizeof(buf),
            "uptime_s=%lu\nserver_up=%d\nmonitor_up=%d\nmonitor_fails=%u\n"
-           "notify_seq=%lu\nlast_notify=%s\nlast_notify_sent=%d\nqueued=%u\n",
+           "notify_seq=%lu\nlast_notify=%s\nlast_notify_sent=%d\nqueued=%u\npower=%s\n",
            (unsigned long)(millis() / 1000), (int)serverUp, (int)monitorUp, (unsigned)monitorFails,
-           (unsigned long)seq, title, (int)sent, (unsigned)qCount);
+           (unsigned long)seq, title, (int)sent, (unsigned)qCount,
+           pw == PM_REBOOT ? "reboot" : pw == PM_SHUTDOWN ? "shutdown" : "none");
   web.send(200, "text/plain", buf);
 }
 
@@ -1256,12 +1579,15 @@ void handleStateJson() {
   PubSite  sites[SITE_COUNT];
   bool     internet, srvUp, monUp, vRead;
   uint32_t cycleTs, vAt, nowMs;
-  uint8_t  vLevel;
+  uint8_t  vLevel, pwType;
+  uint32_t pwTs, pwUntil;
+  bool     pwTest;
   portENTER_CRITICAL(&stateMux);
   memcpy(sites, pubSite, sizeof(sites));
   internet = pubInternet;  srvUp = pubServerUp;  monUp = pubMonitorUp;
   cycleTs  = pubCycleTs;
   vLevel   = pubVerdictLevel;  vAt = pubVerdictAtMs;  vRead = pubVerdictRead;
+  pwType   = pubPowerType;  pwTs = pubPowerTs;  pwUntil = pubPowerUntil;  pwTest = pubPowerTest;
   nowMs    = millis();
   portEXIT_CRITICAL(&stateMux);
 
@@ -1269,7 +1595,7 @@ void handleStateJson() {
   const char* vName = (vRead && vAge <= (long)VERDICT_MAX_AGE_SEC) ? verdictName(vLevel) : "unknown";
 
   String j;
-  j.reserve(1200);
+  j.reserve(1400);
   j += "{\"v\":1,\"uptime_s\":";   j += String((unsigned long)(nowMs / 1000));
   j += ",\"now\":";                  j += String((unsigned long)(clockOK() ? nowEpoch() : 0));
   j += ",\"wifi_rssi\":";            j += String((long)WiFi.RSSI());
@@ -1280,6 +1606,15 @@ void handleStateJson() {
   j += "\",\"cycle_ts\":";           j += String((unsigned long)cycleTs);
   j += ",\"verdict_level\":\"";      j += vName;
   j += "\",\"verdict_age_s\":";      j += String(vAge);
+  if (pwType == PM_NONE) {
+    j += ",\"power\":null";
+  } else {
+    j += ",\"power\":{\"type\":\"";   j += pwType == PM_REBOOT ? "reboot" : "shutdown";
+    j += "\",\"ts\":";                j += String((unsigned long)pwTs);
+    j += ",\"until\":";               j += String((unsigned long)pwUntil);
+    j += ",\"test\":";                j += pwTest ? "true" : "false";
+    j += '}';
+  }
   j += ",\"sites\":[";
   for (uint8_t i = 0; i < SITE_COUNT; i++) {
     if (i) j += ',';
@@ -1305,27 +1640,38 @@ void startWeb() {
   static bool started = false;
   if (started) return;
   started = true;
+#if ENABLE_FAILOVER_API
   web.on("/failover", handleFailover);
+#endif
+#if ENABLE_POWER_API
+  web.on("/power", handlePower);
+#endif
   web.on("/state", HTTP_GET, handleState);
   web.on("/state.json", HTTP_GET, handleStateJson);
   web.onNotFound([]() { web.send(404, "text/plain", "not found\n"); });
   web.begin();
   xTaskCreatePinnedToCore(webTask, "webTask", 6144, nullptr, 1, nullptr, 0);
-  Serial.println("[+] Failover endpoint ready: http://" + WiFi.localIP().toString() + "/failover");
+  Serial.println("[+] Web endpoints ready: http://" + WiFi.localIP().toString() + "/ (/state, /state.json"
+#if ENABLE_FAILOVER_API
+                 ", /failover"
+#endif
+#if ENABLE_POWER_API
+                 ", /power"
+#endif
+                 ")");
 }
+#endif  // ENABLE_FAILOVER_API || ENABLE_POWER_API
+
+#if ENABLE_FAILOVER_API
 
 void handleFailoverPending() {
   uint8_t p = failoverPending;
   if (!p) return;
   failoverPending = 0;
   if (p == 1) {
-    notify("FAILOVER ON: the iMac is answering 443\n\n"
-           "Since: " + fmtTime(failoverSince) + "\n"
-           "mainhomeserver failed its web check and gave up 192.168.1.254, so visitors\n"
-           "to the grey-clouded sites now get the \"temporarily down\" page from the iMac.\n"
-           "dllmch.org, www, tools and mc get it from the Cloudflare Worker.");
+    notifyAlert(failoverOnMsg());
   } else {
-    notify("FAILOVER OFF: 443 is back on mainhomeserver\n\n"
+    notifyAlert("FAILOVER OFF: 443 is back on mainhomeserver\n\n"
            "The iMac handed 192.168.1.254 back at " + fmtTime(nowEpoch()) + ".\n"
            "Failed over since " + fmtTime(failoverSince) + ".");
   }
@@ -1464,7 +1810,7 @@ void setup() {
     syncTime(10000);
 
     startOTA();
-#if ENABLE_FAILOVER_API
+#if ENABLE_FAILOVER_API || ENABLE_POWER_API
     startWeb();
 #endif
     doBootReportIfPending();
@@ -1487,9 +1833,14 @@ void loop() {
 
   if (WiFi.status() == WL_CONNECTED) {
     startOTA();
-#if ENABLE_FAILOVER_API
+#if ENABLE_FAILOVER_API || ENABLE_POWER_API
     startWeb();
+#endif
+#if ENABLE_FAILOVER_API
     handleFailoverPending();
+#endif
+#if ENABLE_POWER_API
+    handlePowerPending();
 #endif
     doBootReportIfPending();
     flushAlertQueue();
@@ -1506,6 +1857,7 @@ void loop() {
     } else {
       readVerdict(false);        // idle between cycles: at most every VERDICT_POLL_MS
     }
+    powerTick();                 // ends a planned-power mute when its conditions hold
     applyVerdictToLed();         // also lets an old "warning" expire after 120 s
     publishState();
   }

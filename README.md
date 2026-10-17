@@ -35,6 +35,9 @@ An RGB LED on the board shows the current state at a glance.
   hung, or its heartbeat page does not answer; and when it is back.
 - **Server alerts blocked / flowing again** — the monitor runs, but has not
   been able to send through the server's Telegram bot for 15 minutes.
+- **Server rebooting / shutting down, server back** — the server announces a
+  planned reboot or shutdown, and the alerts about it are muted meanwhile. See
+  "Planned reboot or shutdown" below.
 
 Alerts raised while the connection is down are queued (up to 12) and sent once
 it comes back, so an outage never swallows its own notification.
@@ -267,16 +270,65 @@ and `Cache-Control: no-store`: `v`, `uptime_s`, `now` (epoch, 0 if the clock is
 not synced), `wifi_rssi`, `internet`, `server_up`, `monitor_up`, `led` (the
 current state as text, for example `site_down` or `server_warning`), `cycle_ts`
 (epoch when the last cycle ended), `verdict_level`, `verdict_age_s` and one
-entry per site (`name`, `up`, `code`, `fails`, `down_since`). It holds no
+entry per site (`name`, `up`, `code`, `fails`, `down_since`), plus `power`
+(`null`, or `{"type","ts","until","test"}` while a planned power signal is in
+force, see below; `/state` has a `power=reboot|shutdown|none` line). It holds no
 secrets. `loop()` copies the values into separate variables under the spinlock
 (`publishState`); the web task reads only those copies. The wall page and the
 server's `wall-status.py` read it. `/state` is unchanged.
+
+**Planned reboot or shutdown (added 2026-10-18).** Before a planned reboot or
+poweroff the server (`power-signal.service`) posts
+`POST http://192.168.1.220/power?type=reboot|shutdown|clear&ts=<epoch>&window=<s>&settle=<s>[&test=1]`
+(no body). Only `192.168.1.200` may (403 otherwise; 405 if not POST; 400 for a
+bad `type`, or a `ts`, `window` (reboot) or `settle` (shutdown) that is not a
+positive integer, or above 86400). The answer is JSON:
+`{"ok":true,"type":"reboot","until":<epoch or 0>,"test":false}` (`until` =
+`ts`+`window` for a reboot when the board clock is synced, else 0). The server
+sends `window=360`, `settle=300`. A new signal replaces the old one; `clear`
+ends the mute at once and sends nothing. The handler only records the request
+under the spinlock; `loop()` applies it (`handlePowerPending`), like `/failover`,
+and does not depend on `ENABLE_FAILOVER_API` (it has its own `ENABLE_POWER_API`).
+
+At once the board sends `SERVER REBOOTING: mainhomeserver` (with `Signal:
+HH:MM:SS` and the latest mute end) or `SERVER SHUTTING DOWN: mainhomeserver`;
+both carry a `TEST ` prefix when `test=1`. From then on it keeps checking and
+keeps its state, LED and `state.json` exactly as without a signal, and only
+drops (does not queue) these alerts: SERVER DOWN/UP, SITE DOWN/UP, HEALTH
+MONITOR DOWN/UP, SERVER ALERTS BLOCKED/FLOWING AGAIN and FAILOVER ON/OFF. They
+all go through `notifyAlert()`; internet/WiFi messages, the daily report and
+command replies still use `notify()` and are not muted.
+
+All timing is `millis()` from the moment the POST is applied, because the board
+clock can be unsynced; the server `ts` is only displayed. The mute ends at the
+first of:
+
+- **reboot:** the server answers pings and a fresh `verdict.txt` (its `ts` at
+  least 15 s after the signal's `ts`, not older than 120 s) says `power=none`;
+  or `window` seconds have passed.
+- **shutdown:** the server answers pings and a fresh `verdict.txt` says
+  `power=none`; or the server has answered pings, without a miss, for `settle`
+  seconds. There is no time limit while the server does not answer.
+
+A `verdict.txt` without a `power=` line never ends a mute. When the mute ends
+with the server answering, one message `SERVER BACK after reboot|shutdown` says
+`Signal:` and `Down for:` (first missed ping to first good ping, `0s` if none
+was missed); then the normal SITE DOWN, HEALTH MONITOR DOWN and FAILOVER ON
+message follows for whatever is down or on right now. What went down and
+recovered inside the mute is never mentioned. If a reboot window ends and the
+server does not answer (after one fresh check cycle), the normal `SERVER DOWN:
+mainhomeserver` goes out with the extra line `Did not come back after its reboot
+signal. Last seen HH:MM:SS with reboot signal.`; the strike logic does not send
+it a second time, and the later recovery sends the normal SERVER UP. The mute
+lives in RAM: a board restart during it ends it. The exact format is in
+[INTERFACE.md](INTERFACE.md) part F.
 
 **Reading the server's verdict (added 2026-10-16).** The server writes its
 combined verdict to `http://192.168.1.200/pinger/verdict.txt` every 5 s
 (`key=value` lines, then `---` and the items). The board reads only
 `level_server=` (`normal`, `caution` or `warning`, which leaves out this
-board's own reports) and `ts=`, with a 2 s timeout, at most every 15 s while
+board's own reports), `ts=` and `power=` (`reboot`, `shutdown` or `none`, used
+only to end a planned-power mute), with a 2 s timeout, at most every 15 s while
 `loop()` is idle between cycles and once at the end of each cycle. It skips the
 read while WiFi is down, while the server looks down, and during OTA. A failed
 read changes nothing and sends nothing. `/status` shows a
@@ -304,6 +356,8 @@ Tunables live near the top of `src/main.cpp`:
 | `VERDICT_TIMEOUT_MS` | 2 s | Timeout for the `verdict.txt` read |
 | `VERDICT_POLL_MS` | 15 s | Shortest time between idle `verdict.txt` reads |
 | `VERDICT_MAX_AGE_SEC` | 120 s | A `warning` read older than this no longer turns the LED orange |
+| `POWER_VERDICT_GUARD_SEC` | 15 s | A `power=none` only ends a mute if `verdict.txt` was written this long after the signal |
+| `POWER_MAX_SEC` | 86400 s | `window`/`settle` above this are refused with 400 |
 
 Keep the site list under about six entries, or a cycle full of timeouts will
 run past the next cycle.
