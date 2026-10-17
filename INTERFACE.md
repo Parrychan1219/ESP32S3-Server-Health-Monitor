@@ -54,6 +54,7 @@ when the server's DNS (AdGuard) or nginx TLS is down.
 | `led` | `wifi_down`, `wifi_idle`, `no_internet`, `server_up`, `server_missed`, `server_dead`, `site_down`, `ota`, `server_warning` |
 | `verdict_level` | Last `level_server` read from part B, or `unknown` (never read, or older than 120 s) |
 | `verdict_age_s` | Seconds since that read, -1 = never |
+| `power` | Planned power action the board knows about (part F), or `null`: `{"type": "reboot"\|"shutdown", "ts": <server epoch of the signal>, "until": <epoch the reboot mute ends at the latest, 0 for shutdown or unsynced clock>, "test": false}`. Also in `/state` as `power=<type\|none>` |
 | `sites[]` | One per entry in `sites.h`, in order. `up` = the board's UP/DOWN after its strike rules; `code` = last HTTP code, negative = transport error; `down_since` = epoch of the first failure of the current outage, 0 when up |
 
 ## B. Server → ESP32: `GET http://192.168.1.200/pinger/verdict.txt`
@@ -74,6 +75,8 @@ warn seafile not running
 - `level`: `warning` if any item is `bad`, `caution` if any is `warn`, else `normal`.
 - `level_server`: the same rule, counting only items that did **not** come from the ESP32 (table C).
   The ESP32 uses this one, so its own report never comes back to it as orange.
+- `power`: `reboot`, `shutdown` or `none` — whether a planned power signal (part G) is still in force on the server.
+  Placed after `ts`. The ESP32 uses it to end its mute (part F). Readers that do not know it ignore it.
 - `count`: number of items. `ts`: epoch when written. Then `---` and up to 5 lines `<bad|warn> <text>`, worst first, ≤ 80 chars.
 
 ## C. Verdict items (`status.json` → `verdict`)
@@ -112,3 +115,91 @@ under NO ANSWER:
 - no answer → `ESP32 not answering either — check the Wi-Fi`
 
 `?esp=<url>` overrides the ESP32 URL for tests.
+
+## F. Server → ESP32: planned reboot / shutdown (`POST http://192.168.1.220/power`)
+
+Design: `Dashboard-as-a-Webapp/docs/superpowers/specs/2026-10-18-power-signal-design.md`. Reboot and shutdown are
+two separate signals. They are never combined.
+
+- `POST /power?type=reboot|shutdown|clear&ts=<epoch>&window=<s>&settle=<s>[&test=1]`, no body.
+- Only from `192.168.1.200` (else 403, nothing changes). Bad or missing `type`, or `ts`/`window`/`settle` not a
+  positive integer when needed → 400.
+- 200 `application/json`: `{"ok":true,"type":"reboot","until":<epoch or 0>,"test":false}`.
+- The server sends `window=360`, `settle=300` today. The board uses the values it receives, timed with `millis()`
+  from the moment it receives the POST (its own clock can be unsynced). `ts` is for display only.
+- A new signal replaces the old one. `clear` ends the mute at once and sends nothing (tests use it).
+
+**Telegram, sent at once on receipt** (prefix `TEST ` on each title when `test=1`):
+
+```
+SERVER REBOOTING: mainhomeserver
+
+Signal: HH:MM:SS
+Alerts muted until HH:MM:SS at the latest (6 min). If it is not back by then, you get SERVER DOWN.
+```
+```
+SERVER SHUTTING DOWN: mainhomeserver
+
+Signal: HH:MM:SS
+Alerts muted until it is back and settled.
+```
+
+**While muted** the board checks, keeps state, publishes `state.json` and drives the LED exactly as without a
+signal. It only does not send: `SERVER DOWN/UP`, `SITE DOWN/UP`, `HEALTH MONITOR DOWN/UP`,
+`SERVER ALERTS BLOCKED/FLOWING AGAIN`, `FAILOVER ON/OFF`. Internet/Wi-Fi messages, the daily report and command
+replies are not muted. Messages muted are dropped, not queued.
+
+**End of mute:**
+
+| Signal | Ends when (first of) | Then |
+|---|---|---|
+| reboot | the server pings **and** a fresh `verdict.txt` (part B, `ts` ≤ 120 s old) says `power=none`; or `window` s have passed | see below |
+| shutdown | the server pings **and** a fresh `verdict.txt` says `power=none`; or the server has pinged for `settle` s | see below |
+
+No time limit while the server does not ping after a shutdown (user's decision, 2026-10-18).
+
+- If the server pings at the end: one message `SERVER BACK after reboot` / `SERVER BACK after shutdown` with
+  `Signal: HH:MM:SS`, `Down for: <duration>` (first missed ping → first good ping; `0s` if no ping was missed).
+  Then, for each site, the health monitor and failover that are DOWN/ON **now**, the normal DOWN/ON message.
+  Nothing for what went down and recovered inside the mute.
+- If a reboot window ends and the server does not ping: the normal `SERVER DOWN: mainhomeserver` message with
+  the extra line `Did not come back after its reboot signal. Last seen HH:MM:SS with reboot signal.`
+  (`last seen` = last good ping), and normal behaviour from then on.
+- The mute lives in RAM. A board restart during a mute ends it (the board then alerts normally).
+
+## G. Server side of the signal
+
+- `power-signal.service` (oneshot, `RemainAfterExit=yes`, enabled) runs `/usr/local/sbin/power-signal.py stop`
+  as `ExecStop`. Ordered `After=network-online.target nginx.service docker.service wall-status.service`, so at
+  shutdown it runs before those stop. Type from the queued job: `reboot.target`/`kexec.target` → `reboot`,
+  `poweroff.target`/`halt.target` → `shutdown`, else no signal.
+- `/var/lib/power-signal/signal.txt` (0644), written atomically, persists across the boot:
+
+```
+type=reboot
+ts=1792262400
+window=360
+settle=300
+boot_id=6c1f…
+test=0
+```
+
+  `type=none` after `--clear`. Served at `GET http://192.168.1.200/pinger/power.txt` (LAN only, `no-store`).
+- **In force** (wall-status, monitor), all must hold: `type` is `reboot` or `shutdown`; `ts` ≤ 7 days old; and
+  - same boot (`boot_id` = current), `test=0`: `now − ts ≤ 300` (the machine is going down; a slow container
+    stop must not turn the wall red, and a cancelled shutdown stops showing after 5 min);
+  - same boot, `test=1`: `now − ts ≤ window` (reboot) or until `--clear` (shutdown);
+  - later boot, reboot: `now < ts + window` and not consumed;
+  - later boot, shutdown: uptime < `settle` and not consumed.
+  - **Consumed** = on a later boot, with uptime ≥ 180 s (before that, nothing has reported yet), the server's own items (without the power item and without ESP32 items) have
+    no `bad` or `warn` left. wall-status records it in `/var/lib/wall-status/power-consumed` (the signal `ts`).
+- `status.json` gains `"power": {"type", "ts", "until", "test"} | null`. (The watt reading that used this name
+  until 2026-10-18 is now `power_monitor.watts`; `health.html` reads both.) (`until` = `ts + window` for reboot, 0 for
+  shutdown). While in force, `verdict.items` starts with a `warn` item — `Server rebooting (since HH:MM:SS)`,
+  `Server shutting down (since HH:MM:SS)` (same boot) or `Server starting after shutdown (since HH:MM:SS)` —
+  and every service item (service-health-monitor lines, failed units, Docker, jobs, ESP32 items) that would be
+  `bad` is `warn`. Hardware items (temperature, disks, md0) keep their state.
+- `service-health-monitor` holds every alert while the signal is in force (it treats "consumed" as in force
+  until uptime ≥ `BOOT_GRACE_SECONDS`), and sends what is still broken afterwards.
+- If the ESP32 does not answer the POST (2 tries, 3 s), `power-signal.py` sends the announcement through
+  `sendtg`, adding `The ESP32 did not acknowledge: its alerts are not muted.`
