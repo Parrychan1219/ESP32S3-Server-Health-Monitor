@@ -112,7 +112,7 @@ const uint8_t SITE_COUNT = sizeof(SITES) / sizeof(SITES[0]);
 const unsigned long PING_INTERVAL   = 60000;  // main check cycle: 1 minute
 const uint16_t  SITE_TIMEOUT_MS     = 8000;   // per-site HTTP timeout
 const uint16_t  SITE_CONNECT_MS     = 6000;   // per-site TCP/TLS connect timeout
-const uint8_t   SITE_FAIL_STRIKES   = 2;      // consecutive fails before "DOWN"
+const uint8_t   SITE_FAIL_STRIKES   = 3;      // consecutive fails before "DOWN" (2 tripped on ~10 s Cloudflare stalls every few days)
 const uint8_t   SITE_OK_STRIKES     = 1;      // consecutive OKs before "UP"
 const uint8_t   SERVER_FAIL_STRIKES = 3;      // unchanged from before
 

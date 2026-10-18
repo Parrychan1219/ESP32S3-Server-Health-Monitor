@@ -13,7 +13,7 @@ An RGB LED on the board shows the current state at a glance.
 | Target | How | Alert |
 |---|---|---|
 | LAN server | ICMP ping, 3 strikes | Down / recovered, with downtime |
-| Public sites | HTTPS request per cycle | Down / recovered, with HTTP code and latency |
+| Public sites | HTTPS request per cycle, 3 strikes | Down / recovered, with HTTP code and latency |
 | Internet | Ping `1.1.1.1` and `8.8.8.8` | Outage start, duration, recovery |
 | WiFi | Association state | Folded into the internet outage report |
 | Mains power | NVS heartbeat + reset reason | Reported on the next boot |
@@ -342,7 +342,7 @@ Tunables live near the top of `src/main.cpp`:
 |---|---|---|
 | `PING_INTERVAL` | 60 s | Main check cycle |
 | `SITE_TIMEOUT_MS` | 8 s | Per-site HTTP timeout |
-| `SITE_FAIL_STRIKES` | 2 | Consecutive failures before "down" |
+| `SITE_FAIL_STRIKES` | 3 | Consecutive failures before "down" (was 2 until 2026-10-19: a one-off ~10 s Cloudflare stall on the second hop of a redirect, twice in a row, sent a SITE DOWN every few days) |
 | `SERVER_FAIL_STRIKES` | 3 | Missed pings before the server is "down" |
 | `HEARTBEAT_MS` | 60 s | NVS write interval, sets power-outage resolution |
 | `REBOOT_AFTER_MS` | 15 min | Self-reboot if WiFi never returns |
