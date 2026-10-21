@@ -229,6 +229,7 @@ long          verdictTs       = 0;        // ts= of that read (server clock)
 enum VerdictPower : uint8_t { VP_UNKNOWN = 0, VP_NONE = 1, VP_ACTIVE = 2 };
 uint8_t       verdictPower    = VP_UNKNOWN;  // power= of that read (VP_UNKNOWN = line absent)
 uint32_t      lastVerdictTry  = 0;
+String        verdictSuppressed = ",";  // suppressed= of that read, as ",a,b," (part H)
 
 struct PubSite { bool up; int code; uint8_t fails; uint32_t downSince; };
 PubSite           pubSite[SITE_COUNT];
@@ -357,6 +358,13 @@ uint32_t verdictAgeSec() { return verdictRead ? (millis() - verdictAtMs) / 1000 
 // True when the last good read said "warning" and is recent enough to trust.
 bool verdictIsWarning() {
   return verdictRead && verdictLevel == VL_WARNING && verdictAgeSec() <= VERDICT_MAX_AGE_SEC;
+}
+
+// True when the server's fresh verdict lists this site as suppressed by the user
+// (part H). No fresh read = nothing is suppressed.
+bool siteSuppressed(const char* name) {
+  return verdictRead && verdictAgeSec() <= VERDICT_MAX_AGE_SEC &&
+         verdictSuppressed.indexOf("," + String(name) + ",") >= 0;
 }
 
 // The state to show when this board itself sees everything fine.
@@ -777,6 +785,10 @@ bool fetchVerdict() {
   pw.trim();
   verdictPower = (pw == "none") ? VP_NONE
                : (pw == "reboot" || pw == "shutdown") ? VP_ACTIVE : VP_UNKNOWN;
+  // suppressed= (part H): a missing line reads as an empty list
+  String sup = hbField(body, "suppressed");
+  sup.trim();
+  verdictSuppressed = "," + sup + ",";
   verdictLevel = level;
   verdictTs    = ts;
   verdictAtMs  = millis();
@@ -1279,9 +1291,7 @@ void handlePowerPending() {
 
 // ================================================================ check cycle
 
-void checkSites(bool &anySiteDown) {
-  anySiteDown = false;
-
+void checkSites() {
   for (uint8_t i = 0; i < SITE_COUNT; i++) {
     SiteState &st = siteState[i];
     int code = 0;
@@ -1323,10 +1333,17 @@ void checkSites(bool &anySiteDown) {
       }
     }
 
-    if (!st.up) anySiteDown = true;
     publishState();
     delay(50);                                 // let the TLS context tear down
   }
+}
+
+// A site that is down and not suppressed by the user (part H). Uses the
+// verdict, so call it after readVerdict().
+bool anySiteDownUnsuppressed() {
+  for (uint8_t i = 0; i < SITE_COUNT; i++)
+    if (!siteState[i].up && !siteSuppressed(SITES[i].name)) return true;
+  return false;
 }
 
 void runCheckCycle() {
@@ -1392,10 +1409,9 @@ void runCheckCycle() {
   checkMonitor();
 
   // ---- public sites ----
-  bool anySiteDown = false;
   if (SITE_COUNT) {
     Serial.println("[*] Checking sites...");
-    checkSites(anySiteDown);
+    checkSites();
   }
 
   // the server's verdict, once per cycle (idle reads in loop() keep it fresh)
@@ -1403,7 +1419,7 @@ void runCheckCycle() {
 
   // site trouble only colours the LED when the LAN server itself looks fine
   if (serverUp && failedServerPings == 0)
-    currentState = anySiteDown ? SITE_DOWN_SERVER_UP : greenState();
+    currentState = anySiteDownUnsuppressed() ? SITE_DOWN_SERVER_UP : greenState();
 
   firstCycleDone = true;
   if (clockOK()) lastCycleTs = (uint32_t)nowEpoch();

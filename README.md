@@ -173,6 +173,9 @@ binaries that are in fact blocked, so do not trust it as a check.
 Orange is shown only in place of green. Every other state keeps its colour and
 wins over orange. It needs a good `level_server=warning` read that is at most
 120 s old; `caution` stays green. The board sends no Telegram message for it.
+A down site that the user suppressed on the wall page (`suppressed=` in the
+verdict, same 120 s freshness rule) does not turn the LED blue; its Telegram
+messages and `state.json` entry are unchanged.
 
 The LED is driven by its own FreeRTOS task on core 0, not by the main loop, so
 it keeps its rhythm while a check cycle is stuck in a timeout. The blink phase
@@ -328,7 +331,8 @@ combined verdict to `http://192.168.1.200/pinger/verdict.txt` every 5 s
 (`key=value` lines, then `---` and the items). The board reads only
 `level_server=` (`normal`, `caution` or `warning`, which leaves out this
 board's own reports), `ts=` and `power=` (`reboot`, `shutdown` or `none`, used
-only to end a planned-power mute), with a 2 s timeout, at most every 15 s while
+only to end a planned-power mute) and `suppressed=` (site names the user muted
+on the wall page), with a 2 s timeout, at most every 15 s while
 `loop()` is idle between cycles and once at the end of each cycle. It skips the
 read while WiFi is down, while the server looks down, and during OTA. A failed
 read changes nothing and sends nothing. `/status` shows a

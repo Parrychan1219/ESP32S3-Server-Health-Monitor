@@ -203,3 +203,68 @@ test=0
   until uptime ≥ `BOOT_GRACE_SECONDS`), and sends what is still broken afterwards.
 - If the ESP32 does not answer the POST (2 tries, 3 s), `power-signal.py` sends the announcement through
   `sendtg`, adding `The ESP32 did not acknowledge: its alerts are not muted.`
+
+## H. Suppressed warnings (2026-10-22)
+
+The user can suppress a red **service/site down** warning from the wall page for 15 min, 1 h, 8 h or
+"until I change it". Cautions (yellow, `warn`) can never be suppressed. A suppressed warning does not
+count for `level`/`level_server`, does not chime, and does not make the ESP32 LED blue or orange.
+**Telegram is unchanged:** `service-health-monitor` and the ESP32 bot still send their DOWN/UP messages
+(standing rule: never mute the user's alerts beyond what was asked).
+
+**Key.** Every suppressible item has a `key`, the name of the thing that is down. Only `bad` items with a key
+can be suppressed:
+
+| Item | Key |
+|---|---|
+| Monitor line `<KIND> since HH:MM: <what>`, state bad (not `SLOW`) | first word of `<what>`, trailing `:` removed (`moodle.sy19.org: HTTP 503` → `moodle.sy19.org`; `fwupd-refresh.service failed` → `fwupd-refresh.service`; container lines → the container name) |
+| `FAILED <unit>` | `<unit>` |
+| `<name> down from outside (ESP32)` | `<name>` (the `sites[].name` of part A) |
+
+Hardware items, jobs, `No internet (ESP32)`, `ESP32 …`, `Docker not answering`, `monitor silent`,
+`Monitor N problems` and the power item have no key. One key covers every bad item with that key, so
+suppressing `moodle.sy19.org` hides both the monitor line and the ESP32 line. Keys match
+`^[A-Za-z0-9._@:+-]{1,120}$`; anything else has no key.
+
+**Store.** `/var/lib/wall-status/suppress.json` (0644, written atomically by `wall-status.py` only):
+
+```json
+{"v": 1, "entries": [{"key": "moodle.sy19.org", "until": 0, "ts": 1792600000,
+                       "text": "DOWN since 18:01: moodle.sy19.org: HTTP 503"}]}
+```
+
+`until` = epoch the suppression ends, `0` = until the user removes it. `ts` = when it was set. `text` = the
+item text when it was set (for the list). An entry with `0 < until <= now` is dropped on the next tick. At most
+50 entries. An entry stays when the problem clears (it is the user's to remove); a time-limited entry that
+expires while the thing is still down brings the red warning (and chime) back.
+
+**API (page → server).** `POST http://192.168.1.200/wall/suppress`, nginx `location = /wall/suppress` in vhost
+`server-status` (inherits its LAN allow/deny) → `proxy_pass http://127.0.0.1:8137` (a thread in `wall-status.py`,
+loopback only). Request header `Content-Type: application/json` required (else 415; this keeps other sites'
+pages from posting cross-origin without a preflight, and no CORS headers are sent). Body ≤ 1024 bytes:
+
+- `{"action": "suppress", "key": "<key>", "minutes": 15|60|480|null}` (`null` = until changed). The key must
+  belong to a **current `bad` item** (else 409 `not a current red warning`). Setting an existing key replaces it.
+- `{"action": "unsuppress", "key": "<key>"}` — removes the entry (404 if none).
+- 200 `{"ok": true, "suppressed": [<entries as in verdict.suppressed>]}`; 400 bad JSON/action/key/minutes;
+  405 not POST; 413 too big. After a change the daemon writes `status.json`/`verdict.txt` within ~1 s.
+- Every change is logged to the journal: `suppress <key> for <15 min|1 h|8 h|until changed>` / `unsuppress <key>`.
+
+**`status.json`.** `verdict.items[]` gain `"key"` on bad items that have one. Suppressed items are **removed** from
+`verdict.items` and from the level. New `verdict.suppressed`: every entry, oldest first:
+`{"key", "until", "ts", "text", "active"}` — `active` = a bad item with this key exists right now (`text` is then
+the current text of the first such item).
+
+**`verdict.txt` (part B).** Items and `count` exclude suppressed items. New line after `power`:
+`suppressed=<key>,<key>,…` — all entries (active or not), in store order, empty value when none, at most
+400 chars (whole keys only). Readers that do not know it ignore it.
+
+**ESP32 (part D).** When the last good verdict read (≤ 120 s) lists a site's `name` in `suppressed`, that site's
+DOWN does not set the blue `site_down` LED state (it still shows in `state.json` `sites[]` as `up: false`, and
+Telegram SITE DOWN/UP is sent as before). If no fresh verdict is available, nothing is suppressed. So with every
+red warning suppressed the LED is green.
+
+**Page.** Each red item with a `key` has a `Suppress` button → chooser `15 min` / `1 hr` / `8 hr` /
+`Until I change it` / `Cancel`. The footer gets a green `· N suppressed` (N = entries) right after
+`updated HH:MM:SS`, on every screen that shows server data; tap → list of entries (key, until, `down now`/`OK now`)
+each with `Unsuppress`, plus `Close`.
