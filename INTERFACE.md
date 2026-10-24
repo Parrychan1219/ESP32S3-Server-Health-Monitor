@@ -75,6 +75,8 @@ warn seafile not running
 - `level`: `warning` if any item is `bad`, `caution` if any is `warn`, else `normal`.
 - `level_server`: the same rule, counting only items that did **not** come from the ESP32 (table C).
   The ESP32 uses this one, so its own report never comes back to it as orange.
+  The wall phone's own battery item (`Wall phone battery N %`, from 2026-10-25) is also left out of it:
+  it counts for `level` and the wall page only, never for the LED.
 - `power`: `reboot`, `shutdown` or `none` — whether a planned power signal (part G) is still in force on the server.
   Placed after `ts`. The ESP32 uses it to end its mute (part F). Readers that do not know it ignore it.
 - `count`: number of items. `ts`: epoch when written. Then `---` and up to 5 lines `<bad|warn> <text>`, worst first, ≤ 80 chars.
