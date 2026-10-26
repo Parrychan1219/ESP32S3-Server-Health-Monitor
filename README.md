@@ -58,7 +58,7 @@ it comes back, so an outage never swallows its own notification.
 └── src/
     ├── main.cpp            the firmware
     ├── sites.h             >>> the list of sites to check <<<
-    ├── secrets.example.h   template
+    ├── secrets.example.h   template (also HOMEKIT_SETUP_CODE)
     └── secrets.h           your credentials (gitignored)
 ```
 
@@ -183,6 +183,43 @@ is taken from the clock rather than toggled, and the current colour is re-sent
 every second even when it has not changed, so a missed write cannot leave the
 LED dark. (Before 2026-09-24 the loop drove it, and a flash froze -- sometimes
 in its "off" half -- for as long as a check blocked.)
+
+## Apple Home (HomeKit)
+
+The board shows up in the Home app as one accessory, **Server Pinger**, with
+two contact sensors. Closed means fine, open means a problem.
+
+| Sensor | Opens when |
+|---|---|
+| **Server** | The LED is flashing red (server down, internet up). Yellow and orange do not open it. |
+| **Websites** | At least one site is down and not suppressed, while the server is up (exactly the blue LED rule; a dead server opens only **Server**). |
+
+Use them for notifications or automations ("when Websites opens, tell me").
+HomeKit is local only: you need a Home hub (HomePod or Apple TV) for
+notifications away from home.
+
+**Pair**
+
+1. Set `HOMEKIT_SETUP_CODE` in `src/secrets.h` to a random 8-digit code (see
+   `secrets.example.h`). `12345678`, `87654321` and all-same digits are
+   rejected. Without a valid code HomeKit stays off and the serial log says so;
+   everything else works as before.
+2. Flash the board. Home app -> Add Accessory -> More options -> *Server
+   Pinger*, and enter the code. (The accessory is unsigned, so Home warns about
+   an "uncertified accessory": continue.)
+
+**Reset pairing** (after removing it in Home, or if Home lost it): open the USB
+serial monitor (`pio device monitor`), type `U` and press Enter. That deletes
+the pairing data and the board is pairable again. Other HomeSpan serial
+commands exist (`?` lists them); `W`/`A` change WiFi credentials, so leave them.
+
+How it fits in: HomeSpan 1.9.1 runs in its own task on core 0 (priority 1, below
+the LED task), HAP listens on TCP 8081 (the web endpoints keep port 80), and
+HomeSpan's OTA, web log and access point are not enabled, so `ota.sh` works as
+before. It is pinned to 1.9.1 because 2.x needs Arduino core 3. The board's
+WiFi stays under `main.cpp`; HomeSpan is given the same SSID and password
+(it needs them to bring up its server) and never asks for credentials. See
+`INTERFACE.md` part I.
 
 ## Telegram commands
 
@@ -362,6 +399,8 @@ Tunables live near the top of `src/main.cpp`:
 | `VERDICT_MAX_AGE_SEC` | 120 s | A `warning` read older than this no longer turns the LED orange |
 | `POWER_VERDICT_GUARD_SEC` | 15 s | A `power=none` only ends a mute if `verdict.txt` was written this long after the signal |
 | `POWER_MAX_SEC` | 86400 s | `window`/`settle` above this are refused with 400 |
+| `ENABLE_HOMEKIT` | 1 | HomeKit accessory (needs `HOMEKIT_SETUP_CODE`) |
+| `HOMEKIT_PORT` | 8081 | HAP TCP port |
 
 Keep the site list under about six entries, or a cycle full of timeouts will
 run past the next cycle.

@@ -21,4 +21,11 @@
 // picks it up automatically.
 // #define OTA_PASSWORD    "choose-something"
 
+// HomeKit pairing code (the Home app asks for it): exactly 8 digits, no dashes.
+// MUST be a random, non-trivial code. HomeKit rejects 12345678, 87654321 and
+// all-same digits, and the firmware refuses to start HomeKit at all while this
+// is the 00000000 placeholder or missing (it never falls back to HomeSpan's
+// well-known default code). Anyone on the LAN who knows it can pair.
+#define HOMEKIT_SETUP_CODE "00000000"
+
 #endif

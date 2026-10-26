@@ -24,7 +24,7 @@ when the server's DNS (AdGuard) or nginx TLS is down.
 
 - LAN only (remote IP `192.168.1.x`, else 403). The older text `/state` stays as it is.
 - Headers: `Access-Control-Allow-Origin: *`, `Cache-Control: no-store`, `Content-Type: application/json`.
-- Body: one JSON object, no secrets, under 1500 bytes.
+- Body: one JSON object, no secrets, under 1700 bytes.
 
 ```json
 {
@@ -41,7 +41,8 @@ when the server's DNS (AdGuard) or nginx TLS is down.
   "verdict_age_s": 7,
   "sites": [
     {"name": "dllmch.org", "up": false, "code": -1, "fails": 3, "down_since": 1792160500}
-  ]
+  ],
+  "homekit": {"enabled": true, "started": true, "paired": true, "server_open": false, "sites_open": true}
 }
 ```
 
@@ -56,6 +57,7 @@ when the server's DNS (AdGuard) or nginx TLS is down.
 | `verdict_age_s` | Seconds since that read, -1 = never |
 | `power` | Planned power action the board knows about (part F), or `null`: `{"type": "reboot"\|"shutdown", "ts": <server epoch of the signal>, "until": <epoch the reboot mute ends at the latest, 0 for shutdown or unsynced clock>, "test": false}`. Also in `/state` as `power=<type\|none>` |
 | `sites[]` | One per entry in `sites.h`, in order. `up` = the board's UP/DOWN after its strike rules; `code` = last HTTP code, negative = transport error; `down_since` = epoch of the first failure of the current outage, 0 when up |
+| `homekit` | HomeKit (part I): `enabled` = compiled in, `started` = HomeSpan is running (false while `HOMEKIT_SETUP_CODE` is missing or the placeholder), `paired` = at least one controller is paired (`null` until started), `server_open` / `sites_open` = the two sensors' wanted state (true = open = problem). Added 2026-10-26; readers that do not know it ignore it |
 
 ## B. Server → ESP32: `GET http://192.168.1.200/pinger/verdict.txt`
 
@@ -270,3 +272,25 @@ red warning suppressed the LED is green.
 `Until I change it` / `Cancel`. The footer gets a green `· N suppressed` (N = entries) right after
 `updated HH:MM:SS`, on every screen that shows server data; tap → list of entries (key, until, `down now`/`OK now`)
 each with `Unsuppress`, plus `Close`.
+
+## I. HomeKit (2026-10-26)
+
+The board is also an Apple HomeKit accessory (HomeSpan 1.9.1, no bridge): **Server Pinger**, category Sensors,
+with two Contact Sensor services. HomeKit is local: it works over the LAN only, and no data goes to the wall
+page or the server from it. The server is not a client of anything here; this part exists so that the sensor
+rules are written down next to the LED rules (part D).
+
+| Sensor | Open (problem) when | Closed (OK) otherwise |
+|---|---|---|
+| `Server` | The LED is flashing red for the server, i.e. `led = server_dead` in part A (3 missed pings, internet up). | Everything else, including yellow (`server_missed`) and orange (`server_warning`, the server's own WARNING verdict). |
+| `Websites` | At least one site is down (after its strike rule) and not suppressed (part H, same 120 s freshness rule). Evaluated at the end of each check cycle with exactly the blue LED condition, including the gate on the server being up (`serverUp && failedServerPings == 0`), so a dead server opens only `Server`. | No such site. |
+
+Notes:
+
+- `Server` follows `currentState`, so it closes while the LED shows something else: `no_internet` (the cycle stops
+  before pinging the server), `wifi_down`. A dead server during an internet outage therefore shows closed.
+- `/state.json` carries the `homekit` object (part A). `/state` (text) has `homekit_started`, `homekit_paired`,
+  `homekit_server_open`, `homekit_sites_open` (0/1).
+- Port: HAP listens on TCP **8081** (80 belongs to the web endpoints). HomeSpan's own web log, OTA and access
+  point are off; ArduinoOTA on 3232 is unchanged. The `_hap._tcp` mDNS service is announced on `esp32-pinger.local`.
+- Pairing code: `HOMEKIT_SETUP_CODE` in `secrets.h`. Without a valid one HomeKit does not start.

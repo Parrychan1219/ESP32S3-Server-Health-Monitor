@@ -16,6 +16,7 @@
  *    file, and says so here when it stops (it alerts through the server's
  *    bot, so if it dies nothing else would tell you)
  *  - Daily digest, OTA updates
+ *  - Apple HomeKit (HomeSpan): two contact sensors, "Server" and "Websites"
  */
 
 #include <WiFi.h>
@@ -34,9 +35,15 @@
 #define ENABLE_DAILY_DIGEST 1
 #define ENABLE_FAILOVER_API 1   // accept failover on/off reports from the iMac
 #define ENABLE_POWER_API    1   // accept the server's planned reboot/shutdown signal
+#define ENABLE_HOMEKIT      1   // two HomeKit contact sensors (needs HOMEKIT_SETUP_CODE in secrets.h)
 
 #if ENABLE_OTA
   #include <ArduinoOTA.h>
+#endif
+#if ENABLE_HOMEKIT
+  #include <HomeSpan.h>
+  #include <sodium.h>   // HAP.h needs the crypto_* sizes declared first
+  #include <HAP.h>      // HAPClient::nAdminControllers(): the only way to read the pairing state in 1.9.1
 #endif
 
 // ---------------------------------------------------------------- credentials
@@ -264,6 +271,14 @@ bool     bootReportPending = true;
 bool     otaStarted        = false;
 volatile bool otaInProgress   = false;
 
+// HomeKit. hkSitesOpen is written by loop() when it decides the LED colour
+// (runCheckCycle); hkStarted/hkPaired are written by the HomeSpan task. Plain
+// volatile bools: one writer each, read by other tasks (HomeSpan task, web task).
+// The Server sensor needs no flag: it reads currentState directly (hkServerOpen()).
+volatile bool hkSitesOpen = false;   // a site is down and not suppressed
+volatile bool hkStarted   = false;   // HomeSpan was started
+volatile bool hkPaired    = false;   // at least one admin controller is paired
+
 // S3 built-in RGB LED
 #ifndef RGB_BUILTIN
 #define RGB_BUILTIN 48
@@ -376,6 +391,12 @@ void applyVerdictToLed() {
   if (s == SERVER_UP && verdictIsWarning())                    currentState = SERVER_REPORTS_WARNING;
   else if (s == SERVER_REPORTS_WARNING && !verdictIsWarning()) currentState = SERVER_UP;
 }
+
+// The Server contact sensor is OPEN exactly while the LED shows the server's red
+// (flashing red = SERVER_DEAD_INTERNET_UP). Yellow (missed ping) and orange (the
+// server's own WARNING verdict) leave it closed. currentState is a volatile enum,
+// already read by the LED task on the other core. The OTA overlay is not part of it.
+bool hkServerOpen() { return currentState == SERVER_DEAD_INTERNET_UP; }
 
 // ================================================================ LEDs
 // The LED is driven by its own task on core 0 (see ledTask), never by loop().
@@ -1417,6 +1438,11 @@ void runCheckCycle() {
   // the server's verdict, once per cycle (idle reads in loop() keep it fresh)
   readVerdict(true);
 
+  // HomeKit "Websites" sensor: exactly the blue LED condition (down, not
+  // suppressed, and only while the LAN server looks fine), so a dead server
+  // opens "Server" alone (user's choice, 2026-10-26)
+  hkSitesOpen = serverUp && failedServerPings == 0 && anySiteDownUnsuppressed();
+
   // site trouble only colours the LED when the LAN server itself looks fine
   if (serverUp && failedServerPings == 0)
     currentState = anySiteDownUnsuppressed() ? SITE_DOWN_SERVER_UP : greenState();
@@ -1544,13 +1570,16 @@ void handleState() {
   bool sent = lastNotifySent;
   uint8_t pw = pubPowerType;
   portEXIT_CRITICAL(&stateMux);
-  char buf[360];
+  char buf[460];
   snprintf(buf, sizeof(buf),
            "uptime_s=%lu\nserver_up=%d\nmonitor_up=%d\nmonitor_fails=%u\n"
-           "notify_seq=%lu\nlast_notify=%s\nlast_notify_sent=%d\nqueued=%u\npower=%s\n",
+           "notify_seq=%lu\nlast_notify=%s\nlast_notify_sent=%d\nqueued=%u\npower=%s\n"
+           "homekit_started=%d\nhomekit_paired=%d\nhomekit_server_open=%d\nhomekit_sites_open=%d\n",
            (unsigned long)(millis() / 1000), (int)serverUp, (int)monitorUp, (unsigned)monitorFails,
            (unsigned long)seq, title, (int)sent, (unsigned)qCount,
-           pw == PM_REBOOT ? "reboot" : pw == PM_SHUTDOWN ? "shutdown" : "none");
+           pw == PM_REBOOT ? "reboot" : pw == PM_SHUTDOWN ? "shutdown" : "none",
+           (int)(ENABLE_HOMEKIT && hkStarted), (int)(ENABLE_HOMEKIT && hkStarted && hkPaired),
+           (int)hkServerOpen(), (int)hkSitesOpen);
   web.send(200, "text/plain", buf);
 }
 
@@ -1611,7 +1640,7 @@ void handleStateJson() {
   const char* vName = (vRead && vAge <= (long)VERDICT_MAX_AGE_SEC) ? verdictName(vLevel) : "unknown";
 
   String j;
-  j.reserve(1400);
+  j.reserve(1600);
   j += "{\"v\":1,\"uptime_s\":";   j += String((unsigned long)(nowMs / 1000));
   j += ",\"now\":";                  j += String((unsigned long)(clockOK() ? nowEpoch() : 0));
   j += ",\"wifi_rssi\":";            j += String((long)WiFi.RSSI());
@@ -1641,7 +1670,12 @@ void handleStateJson() {
     j += ",\"down_since\":";         j += String((unsigned long)sites[i].downSince);
     j += '}';
   }
-  j += "]}";
+  j += "],\"homekit\":{\"enabled\":";  j += ENABLE_HOMEKIT ? "true" : "false";
+  j += ",\"started\":";                  j += hkStarted ? "true" : "false";
+  j += ",\"paired\":";                   j += !hkStarted ? "null" : hkPaired ? "true" : "false";
+  j += ",\"server_open\":";              j += hkServerOpen() ? "true" : "false";
+  j += ",\"sites_open\":";               j += hkSitesOpen ? "true" : "false";
+  j += "}}";
   web.send(200, "application/json", j);
 }
 
@@ -1753,6 +1787,99 @@ void startOTA() {
 #endif
 }
 
+#if ENABLE_HOMEKIT
+// ---------------------------------------------------------------- HomeKit
+// HomeSpan 1.9.1 (the last release for Arduino core 2.x). One bridge-less
+// accessory with two contact sensors. HomeSpan polls in its own task
+// (autoPoll), so loop() blocking in a check timeout cannot stall pairing or
+// event delivery. All characteristic writes happen in that task, from the
+// sensors' loop() methods below, which only read the flags set above.
+
+#define FW_VERSION "2.0.0"   // shown as HomeKit firmware revision (HAP wants x.y.z); the HTTP user agent says 2.0
+static const uint16_t HOMEKIT_PORT = 8081;   // HomeSpan's default is 80, which the web server already holds
+
+// Mirrors HomeSpan's own rejects (00000000, 11111111 ... 99999999, 12345678,
+// 87654321); anything else but 8 digits is refused too. setPairingCode() would
+// halt the board on a bad code, so the check is done first.
+static bool hkCodeValid(const char* c) {
+  if (!c || strlen(c) != 8) return false;
+  bool same = true;
+  for (uint8_t i = 0; i < 8; i++) {
+    if (!isdigit((uint8_t)c[i])) return false;
+    if (c[i] != c[0]) same = false;
+  }
+  if (same) return false;                                   // includes the 00000000 placeholder
+  return strcmp(c, "12345678") && strcmp(c, "87654321");
+}
+
+// A contact sensor that follows a bool source. closed (DETECTED, 0) = OK, open (NOT_DETECTED, 1) = problem.
+struct HkContactSensor : Service::ContactSensor {
+  Characteristic::ContactSensorState state{0};
+  bool (*isOpen)();
+  HkContactSensor(const char* name, bool (*src)()) : Service::ContactSensor(), isOpen(src) {
+    new Characteristic::Name(name);
+  }
+  void loop() override {                                    // runs in the HomeSpan task
+    int want = isOpen() ? 1 : 0;
+    if (state.getVal() != want) state.setVal(want);
+    hkPaired = HAPClient::nAdminControllers() > 0;
+  }
+};
+
+static bool hkSitesSource() { return hkSitesOpen; }
+
+void startHomeKit() {
+  static bool tried = false;
+  if (tried) return;
+  tried = true;
+
+#ifndef HOMEKIT_SETUP_CODE
+  Serial.println("[-] HomeKit not started: HOMEKIT_SETUP_CODE is not defined in secrets.h.");
+  return;
+#else
+  if (!hkCodeValid(HOMEKIT_SETUP_CODE)) {
+    Serial.println("[-] HomeKit not started: HOMEKIT_SETUP_CODE in secrets.h is the placeholder or too simple "
+                   "(need 8 digits, not all the same, not 12345678/87654321).");
+    return;
+  }
+
+  homeSpan.setLogLevel(0);
+  homeSpan.setPortNum(HOMEKIT_PORT);
+  // 1.9.1 only brings up its HAP server and mDNS once it sees WiFi connected
+  // through *its* credentials, so it gets the same ones this firmware uses. It
+  // never starts an access point or asks for credentials.
+  homeSpan.setWifiCredentials(ssid, pw);
+  homeSpan.setSketchVersion(FW_VERSION);
+  // No status LED, no control button: the RGB LED belongs to ledTask. No
+  // enableOTA() (ArduinoOTA is ours) and no enableWebLog() (the web server is ours).
+  homeSpan.begin(Category::Sensors, "Server Pinger", "esp32-pinger", "ESP32-S3 Server Pinger");
+  homeSpan.setPairingCode(HOMEKIT_SETUP_CODE);              // after begin(); before polling starts
+
+  static char serial[20];
+  snprintf(serial, sizeof(serial), "%s", WiFi.macAddress().c_str());
+
+  new SpanAccessory();
+    new Service::AccessoryInformation();
+      new Characteristic::Identify();
+      new Characteristic::Name("Server Pinger");
+      new Characteristic::Manufacturer("DIY");
+      new Characteristic::Model("ESP32-S3 Server Pinger");
+      new Characteristic::SerialNumber(serial);
+      new Characteristic::FirmwareRevision(FW_VERSION);
+    new HkContactSensor("Server", hkServerOpen);
+    new HkContactSensor("Websites", hkSitesSource);
+
+  // Core 0, priority 1: the LED task (priority 2) preempts it, so the LED
+  // rhythm survives the seconds of big-number maths in pairing; web and OTA
+  // tasks (priority 1) share time with it. Core 0 is also the core HomeSpan
+  // removes the idle watchdog from, which pairing needs.
+  homeSpan.autoPoll(8192, 1, 0);
+  hkStarted = true;
+  Serial.println("[+] HomeKit ready: port " + String(HOMEKIT_PORT));
+#endif
+}
+#endif  // ENABLE_HOMEKIT
+
 // Deferred until we have both a connection and a synced clock, so a mains
 // outage that also took the router down still gets reported once it returns.
 void doBootReportIfPending() {
@@ -1829,6 +1956,9 @@ void setup() {
 #if ENABLE_FAILOVER_API || ENABLE_POWER_API
     startWeb();
 #endif
+#if ENABLE_HOMEKIT
+    startHomeKit();
+#endif
     doBootReportIfPending();
     currentState = WIFI_CONNECTED_IDLE;
   } else {
@@ -1851,6 +1981,9 @@ void loop() {
     startOTA();
 #if ENABLE_FAILOVER_API || ENABLE_POWER_API
     startWeb();
+#endif
+#if ENABLE_HOMEKIT
+    startHomeKit();
 #endif
 #if ENABLE_FAILOVER_API
     handleFailoverPending();
